@@ -1,6 +1,6 @@
 import streamlit as st
 from openai import OpenAI
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 import pytesseract
 from pytesseract import Output
 import base64
@@ -17,7 +17,7 @@ client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
 st.title("🌐 AI 상세페이지 번역기")
 st.write("분할된 상세페이지 이미지를 여러 장 업로드하면 순서대로 번역합니다.")
-st.caption("원본 이미지와 번역문은 별도 영역에 표시됩니다. 영문은 한국어 번역 대상으로 잡지 않도록 이중 OCR 필터를 적용합니다.")
+st.caption("한국어 위치 검출 시 영문 오인식 제거, 같은 줄 문장 병합, 흰색 한글 보완 검사를 함께 적용합니다.")
 
 language_map = {
     "러시아어": "Russian",
@@ -61,7 +61,7 @@ def count_hangul(text):
 def count_latin(text):
     return len(re.findall(r"[A-Za-z]", text))
 
-def box_iou(a, b):
+def intersection_area(a, b):
     ax1, ay1 = a["x"], a["y"]
     ax2, ay2 = ax1 + a["w"], ay1 + a["h"]
 
@@ -76,17 +76,129 @@ def box_iou(a, b):
     iw = max(0, ix2 - ix1)
     ih = max(0, iy2 - iy1)
 
-    inter = iw * ih
+    return iw * ih
+
+def box_iou(a, b):
+    inter = intersection_area(a, b)
+
     area_a = max(1, a["w"] * a["h"])
     area_b = max(1, b["w"] * b["h"])
-    union = area_a + area_b - inter
 
+    union = area_a + area_b - inter
     return inter / union if union > 0 else 0
+
+def overlap_ratio_of_candidate(candidate, other):
+    """
+    candidate 영역 중 other 박스가 얼마나 덮는지 계산합니다.
+    PACKAGE RENEWAL처럼 영어 단어가 여러 조각으로 나뉘어도
+    후보 영역을 많이 덮으면 영문으로 판단할 수 있게 합니다.
+    """
+    inter = intersection_area(candidate, other)
+    area_candidate = max(1, candidate["w"] * candidate["h"])
+    return inter / area_candidate
+
+def vertical_overlap_ratio(a, b):
+    ay1, ay2 = a["y"], a["y"] + a["h"]
+    by1, by2 = b["y"], b["y"] + b["h"]
+
+    overlap = max(0, min(ay2, by2) - max(ay1, by1))
+    return overlap / max(1, min(a["h"], b["h"]))
+
+def horizontal_gap(a, b):
+    if a["x"] <= b["x"]:
+        return b["x"] - (a["x"] + a["w"])
+    return a["x"] - (b["x"] + b["w"])
+
+def merge_two_boxes(a, b):
+    x1 = min(a["x"], b["x"])
+    y1 = min(a["y"], b["y"])
+    x2 = max(a["x"] + a["w"], b["x"] + b["w"])
+    y2 = max(a["y"] + a["h"], b["y"] + b["h"])
+
+    if a["x"] <= b["x"]:
+        merged_text = (a["text"].rstrip() + " " + b["text"].lstrip()).strip()
+    else:
+        merged_text = (b["text"].rstrip() + " " + a["text"].lstrip()).strip()
+
+    return {
+        "text": re.sub(r"\s+", " ", merged_text),
+        "x": x1,
+        "y": y1,
+        "w": x2 - x1,
+        "h": y2 - y1,
+        "confidence": round(
+            (float(a.get("confidence", 0)) + float(b.get("confidence", 0))) / 2,
+            1,
+        ),
+    }
+
+def merge_same_line_boxes(lines, image_width):
+    """
+    같은 줄인데 OCR이 '습니다', '니다', '제'처럼 여러 박스로
+    쪼갠 결과를 하나의 문장 박스로 합칩니다.
+    """
+    if not lines:
+        return []
+
+    lines = sorted(lines, key=lambda item: (item["y"], item["x"]))
+    merged = []
+
+    for current in lines:
+        if not merged:
+            merged.append(current.copy())
+            continue
+
+        previous = merged[-1]
+
+        v_overlap = vertical_overlap_ratio(previous, current)
+        gap = horizontal_gap(previous, current)
+
+        avg_h = (previous["h"] + current["h"]) / 2
+        max_gap = max(
+            35,
+            int(avg_h * 3.2),
+            int(image_width * 0.045),
+        )
+
+        # 같은 줄 + 간격이 가까우면 하나의 문장으로 병합
+        if v_overlap >= 0.55 and -20 <= gap <= max_gap:
+            merged[-1] = merge_two_boxes(previous, current)
+        else:
+            merged.append(current.copy())
+
+    return merged
+
+def deduplicate_boxes(lines):
+    """
+    원본/반전 OCR을 동시에 돌렸을 때 같은 문구가 중복 검출되는 것을 제거합니다.
+    """
+    result = []
+
+    for line in sorted(lines, key=lambda item: (item["y"], item["x"])):
+        duplicate_index = None
+
+        for idx, existing in enumerate(result):
+            if box_iou(line, existing) >= 0.55:
+                duplicate_index = idx
+                break
+
+        if duplicate_index is None:
+            result.append(line)
+        else:
+            existing = result[duplicate_index]
+
+            # 더 긴 한국어 문장을 우선 사용
+            if count_hangul(line["text"]) > count_hangul(existing["text"]):
+                result[duplicate_index] = line
+            elif line.get("confidence", 0) > existing.get("confidence", 0):
+                result[duplicate_index] = line
+
+    return result
 
 def get_confident_english_boxes(image):
     """
-    같은 이미지를 영어 OCR로 한 번 더 읽습니다.
-    영어로 자신 있게 읽히는 영역은 한국어 오인식 후보에서 제외합니다.
+    영어 전용 OCR 결과를 수집합니다.
+    실제 영문을 한국어로 오인한 후보를 제거하는 데 사용합니다.
     """
     data = pytesseract.image_to_data(
         image,
@@ -107,7 +219,7 @@ def get_confident_english_boxes(image):
 
         latin_count = count_latin(text)
 
-        if conf < 55:
+        if conf < 45:
             continue
 
         if latin_count < 2:
@@ -126,18 +238,24 @@ def get_confident_english_boxes(image):
 
     return english_boxes
 
-def detect_korean_lines(image):
+def english_coverage(candidate, english_boxes):
     """
-    한국어 후보를 찾은 뒤,
-    같은 위치가 영어 OCR에서 확실하게 영문으로 읽히면 제거합니다.
-
-    또한 한 글자짜리 한글 후보와 영문 비율이 높은 줄을 제외해
-    PACKAGE / Lifting / NEW / 17Hours 같은 영문이
-    가짜 한글로 잡히는 것을 최대한 방지합니다.
+    후보 박스 내부를 영어 OCR 박스들이 얼마나 덮는지 계산합니다.
+    영어 단어가 2~3개로 분리돼도 합산하여 판정합니다.
     """
+    candidate_area = max(1, candidate["w"] * candidate["h"])
+    covered = 0
 
-    english_boxes = get_confident_english_boxes(image)
+    for eng in english_boxes:
+        covered += intersection_area(candidate, eng)
 
+    # 겹치는 영어 박스끼리 중복 계산될 수 있으므로 1.0으로 제한
+    return min(1.0, covered / candidate_area)
+
+def run_korean_candidate_ocr(image):
+    """
+    한 번의 OCR 패스에서 한국어 후보 라인을 추출합니다.
+    """
     data = pytesseract.image_to_data(
         image,
         lang="kor+eng",
@@ -146,7 +264,6 @@ def detect_korean_lines(image):
     )
 
     groups = {}
-
     total = len(data["text"])
 
     for i in range(total):
@@ -157,7 +274,7 @@ def detect_korean_lines(image):
         except (ValueError, TypeError):
             conf = -1
 
-        if not raw_text or conf < 20:
+        if not raw_text or conf < 18:
             continue
 
         key = (
@@ -191,53 +308,101 @@ def detect_korean_lines(image):
     lines = []
 
     for group in groups.values():
-        text = " ".join(group["words"]).strip()
+        text = re.sub(r"\s+", " ", " ".join(group["words"]).strip())
 
         hangul_count = count_hangul(text)
         latin_count = count_latin(text)
-        total_letters = hangul_count + latin_count
 
         if hangul_count == 0:
             continue
 
-        # 영문을 '후', '비' 같은 한 글자 한글로 잘못 읽는 오탐 차단
-        if hangul_count < 2:
-            continue
-
-        # 실제 한글보다 영문 비율이 더 높은 줄은 한국어 카피로 보지 않음
+        total_letters = hangul_count + latin_count
         hangul_ratio = hangul_count / max(1, total_letters)
-        if hangul_ratio < 0.45:
+
+        # 영어를 '후', '비' 등으로 잘못 읽은 짧은 오탐 제거
+        if hangul_count == 1 and len(text.replace(" ", "")) > 1:
             continue
 
-        candidate = {
-            "text": text,
-            "x": group["x1"],
-            "y": group["y1"],
-            "w": group["x2"] - group["x1"],
-            "h": group["y2"] - group["y1"],
-        }
-
-        # 영어 OCR이 같은 위치를 영문으로 확실하게 읽으면 한국어 후보 제거
-        english_overlap = False
-
-        for eng in english_boxes:
-            if box_iou(candidate, eng) >= 0.30:
-                english_overlap = True
-                break
-
-        if english_overlap:
+        # 영문이 대부분인 줄은 한국어 본문이 아님
+        if hangul_ratio < 0.40:
             continue
 
         conf_values = group["conf_values"]
         avg_conf = sum(conf_values) / len(conf_values) if conf_values else 0
 
-        candidate["confidence"] = round(avg_conf, 1)
-        candidate["hangul_ratio"] = round(hangul_ratio, 2)
+        lines.append(
+            {
+                "text": text,
+                "x": group["x1"],
+                "y": group["y1"],
+                "w": group["x2"] - group["x1"],
+                "h": group["y2"] - group["y1"],
+                "confidence": round(avg_conf, 1),
+            }
+        )
 
-        lines.append(candidate)
-
-    lines.sort(key=lambda item: (item["y"], item["x"]))
     return lines
+
+def detect_korean_lines(image):
+    """
+    개선된 한국어 위치 검출
+
+    1. 원본 이미지 OCR
+    2. 명암 반전 이미지 OCR
+       -> '기존', '리뉴얼'처럼 색 박스 안 흰색 글자 검출 보완
+    3. 영어 전용 OCR과 비교
+       -> PACKAGE RENEWAL / Lifting / NEW / 17Hours 오탐 제거
+    4. 같은 줄에서 쪼개진 문장을 하나의 박스로 병합
+    """
+
+    english_boxes = get_confident_english_boxes(image)
+
+    # 첫 번째 패스: 원본
+    candidates = run_korean_candidate_ocr(image)
+
+    # 두 번째 패스: 대비 강화 + 반전
+    gray = ImageOps.grayscale(image)
+    gray = ImageOps.autocontrast(gray)
+    inverted = ImageOps.invert(gray).convert("RGB")
+
+    inverted_candidates = run_korean_candidate_ocr(inverted)
+
+    candidates.extend(inverted_candidates)
+    candidates = deduplicate_boxes(candidates)
+
+    filtered = []
+
+    for candidate in candidates:
+        hangul_count = count_hangul(candidate["text"])
+        latin_count = count_latin(candidate["text"])
+        hangul_ratio = hangul_count / max(1, hangul_count + latin_count)
+
+        coverage = english_coverage(candidate, english_boxes)
+
+        # PACKAGE RENEWAL처럼 영어 OCR이 후보 대부분을 덮으면 제거
+        if coverage >= 0.38 and hangul_ratio < 0.80:
+            continue
+
+        # 영어 전용 OCR과 강하게 겹치고 한글이 매우 짧으면 제거
+        strongly_english = False
+
+        for eng in english_boxes:
+            if overlap_ratio_of_candidate(candidate, eng) >= 0.45:
+                if hangul_count <= 3:
+                    strongly_english = True
+                    break
+
+        if strongly_english:
+            continue
+
+        filtered.append(candidate)
+
+    # 먼저 같은 줄 분절을 합친 뒤 정렬
+    filtered = merge_same_line_boxes(filtered, image.width)
+    filtered = deduplicate_boxes(filtered)
+    filtered.sort(key=lambda item: (item["y"], item["x"]))
+
+    return filtered
 
 def draw_detection_preview(image, lines):
     """
