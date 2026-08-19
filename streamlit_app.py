@@ -7,42 +7,45 @@ import io
 st.set_page_config(
     page_title="AI 상세페이지 번역기",
     page_icon="🌐",
-    layout="wide"
+    layout="wide",
 )
 
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
 st.title("🌐 AI 상세페이지 번역기")
 st.write("분할된 상세페이지 이미지를 여러 장 업로드하면 순서대로 번역합니다.")
-st.write("※ 번역문은 이미지 위에 쓰지 않고, 따로 표시하므로 이미지와 글자가 겹치지 않습니다.")
+st.caption("※ 원본 이미지와 번역문은 서로 다른 영역에 표시되므로 겹치지 않습니다.")
 
 language_map = {
     "러시아어": "Russian",
     "영어": "English",
     "일본어": "Japanese",
     "중국어": "Chinese",
-    "베트남어": "Vietnamese"
+    "베트남어": "Vietnamese",
 }
 
 selected_language = st.selectbox(
     "번역할 언어를 선택하세요",
-    ["러시아어", "영어", "일본어", "중국어", "베트남어"]
+    ["러시아어", "영어", "일본어", "중국어", "베트남어"],
 )
 
 uploaded_files = st.file_uploader(
     "분할된 JPG 또는 PNG 이미지를 여러 장 올려주세요",
     type=["jpg", "jpeg", "png"],
-    accept_multiple_files=True
+    accept_multiple_files=True,
 )
 
 def image_to_base64(uploaded_file):
     image = Image.open(uploaded_file).convert("RGB")
     buffer = io.BytesIO()
     image.save(buffer, format="JPEG", quality=95)
-    return base64.b64encode(buffer.getvalue()).decode("utf-8"), image
+    encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
+    return encoded, image
+
+if "all_results" not in st.session_state:
+    st.session_state.all_results = []
 
 if uploaded_files:
-
     st.subheader("업로드된 이미지")
     st.write(f"총 {len(uploaded_files)}장의 이미지가 업로드되었습니다.")
     st.info("업로드한 순서대로 번역됩니다. (1번 → 2번 → 3번...)")
@@ -50,17 +53,13 @@ if uploaded_files:
     for idx, file in enumerate(uploaded_files, start=1):
         st.markdown(f"**{idx}번 이미지: {file.name}**")
 
-    if st.button("🚀 AI 번역 시작"):
-
+    if st.button("🚀 AI 번역 시작", type="primary"):
         all_results = []
         progress = st.progress(0)
 
         for idx, uploaded_file in enumerate(uploaded_files, start=1):
-
             with st.spinner(f"{idx}/{len(uploaded_files)} 번역 중..."):
-
                 base64_image, preview_image = image_to_base64(uploaded_file)
-
                 target_language = language_map[selected_language]
 
                 prompt = f"""
@@ -80,14 +79,14 @@ if uploaded_files:
 규칙:
 1. 이미지에 실제로 보이는 문구만 적으세요.
 2. 숫자, %, ppm, ml, g, 날짜, 시험 수치는 원문 그대로 유지하세요.
-3. 브랜드명/제품명/영문 제품명은 함부로 번역하지 마세요.
+3. 브랜드명, 제품명, 영문 제품명은 함부로 번역하지 마세요.
 4. 전성분은 번역하지 말고 아래처럼 표시하세요:
-   [전성분]
-   영문 INCI 유지
-5. 화장품 광고 문구는 치료/완치/재생 같은 의료적 표현으로 과장하지 마세요.
+[전성분]
+영문 INCI 유지
+5. 화장품 광고 문구는 치료, 완치, 재생 같은 의료적 표현으로 과장하지 마세요.
 6. 설명문은 짧고 자연스럽게 번역하세요.
 7. 같은 문구가 반복되어 보이면 한 번만 정리하세요.
-8. 불필요한 설명은 쓰지 말고, 번역 결과만 정리하세요.
+8. 불필요한 설명은 쓰지 말고 번역 결과만 정리하세요.
 """
 
                 response = client.responses.create(
@@ -98,112 +97,95 @@ if uploaded_files:
                             "content": [
                                 {
                                     "type": "input_text",
-                                    "text": prompt
+                                    "text": prompt,
                                 },
                                 {
                                     "type": "input_image",
                                     "image_url": f"data:image/jpeg;base64,{base64_image}",
-                                    "detail": "high"
-                                }
-                            ]
+                                    "detail": "high",
+                                },
+                            ],
                         }
-                    ]
+                    ],
                 )
 
-                result_text = response.output_text
                 all_results.append(
                     {
                         "index": idx,
                         "file_name": uploaded_file.name,
                         "image": preview_image,
-                        "translation": result_text
+                        "translation": response.output_text,
+                        "language": selected_language,
                     }
                 )
 
                 progress.progress(idx / len(uploaded_files))
 
-             st.success("✅ 모든 이미지 번역이 완료되었습니다.")
+        st.session_state.all_results = all_results
+        st.success("✅ 모든 이미지 번역이 완료되었습니다.")
 
+if st.session_state.all_results:
+    st.markdown("---")
+    st.header("📑 이미지별 번역 결과")
+
+    combined_text = ""
+
+    for item in st.session_state.all_results:
         st.markdown("---")
-        st.header("📑 이미지별 번역 결과")
-
-        combined_text = ""
-
-        for item in all_results:
-
-            st.markdown("---")
-
-            # 이미지 제목
-            st.subheader(
-                f"{item['index']}번 이미지 · {item['file_name']}"
-            )
-
-            # 다운로드 버튼을 위쪽에 배치
-            st.download_button(
-                label=f"📥 {item['index']}번 번역문 다운로드",
-                data=item["translation"],
-                file_name=f"{item['index']:02d}_translation.txt",
-                mime="text/plain",
-                key=f"download_top_{item['index']}"
-            )
-
-            # 이미지와 번역문 완전 분리
-            col_image, col_text = st.columns(
-                [1, 1],
-                gap="large"
-            )
-
-            with col_image:
-
-                st.markdown("### 🖼️ 원본 이미지")
-
-                st.image(
-                    item["image"],
-                    use_container_width=True
-                )
-
-            with col_text:
-
-                st.markdown(
-                    f"### 🌐 {selected_language} 번역"
-                )
-
-                edited_translation = st.text_area(
-                    "번역문 검수/수정",
-                    value=item["translation"],
-                    height=600,
-                    key=f"translation_edit_{item['index']}"
-                )
-
-                st.download_button(
-                    label="📥 수정한 번역문 다운로드",
-                    data=edited_translation,
-                    file_name=f"{item['index']:02d}_{selected_language}_final.txt",
-                    mime="text/plain",
-                    key=f"download_edit_{item['index']}"
-                )
-
-            combined_text += (
-                f"\n\n"
-                f"========== {item['index']}번 이미지 ==========\n"
-                f"파일명: {item['file_name']}\n\n"
-                f"{edited_translation}\n"
-            )
-
-        st.markdown("---")
-        st.header("📚 전체 번역 결과")
-
-        st.text_area(
-            "전체 이미지 번역 모음",
-            combined_text,
-            height=600,
-            key="combined_translation"
-        )
+        st.subheader(f"{item['index']}번 이미지 · {item['file_name']}")
 
         st.download_button(
-            label="📥 전체 번역 결과 다운로드",
-            data=combined_text,
-            file_name=f"ALL_{selected_language}_translation.txt",
+            label=f"📥 {item['index']}번 원본 번역문 다운로드",
+            data=item["translation"],
+            file_name=f"{item['index']:02d}_translation.txt",
             mime="text/plain",
-            key="download_all"
+            key=f"download_original_{item['index']}",
         )
+
+        col_image, col_text = st.columns([1, 1], gap="large")
+
+        with col_image:
+            st.markdown("### 🖼️ 원본 이미지")
+            st.image(item["image"], use_container_width=True)
+
+        with col_text:
+            st.markdown(f"### 🌐 {item['language']} 번역")
+
+            edited_translation = st.text_area(
+                "번역문 검수/수정",
+                value=item["translation"],
+                height=600,
+                key=f"translation_edit_{item['index']}",
+            )
+
+            st.download_button(
+                label="📥 수정한 번역문 다운로드",
+                data=edited_translation,
+                file_name=f"{item['index']:02d}_{item['language']}_final.txt",
+                mime="text/plain",
+                key=f"download_edit_{item['index']}",
+            )
+
+        combined_text += (
+            f"\n\n========== {item['index']}번 이미지 ==========\n"
+            f"파일명: {item['file_name']}\n\n"
+            f"{edited_translation}\n"
+        )
+
+    st.markdown("---")
+    st.header("📚 전체 번역 결과")
+
+    st.text_area(
+        "전체 이미지 번역 모음",
+        value=combined_text,
+        height=600,
+        key="combined_translation",
+    )
+
+    st.download_button(
+        label="📥 전체 번역 결과 다운로드",
+        data=combined_text,
+        file_name=f"ALL_{selected_language}_translation.txt",
+        mime="text/plain",
+        key="download_all",
+    )
