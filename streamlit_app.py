@@ -1,8 +1,11 @@
 import streamlit as st
 from openai import OpenAI
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
+import pytesseract
+from pytesseract import Output
 import base64
 import io
+import re
 
 st.set_page_config(
     page_title="AI 상세페이지 번역기",
@@ -14,7 +17,7 @@ client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
 st.title("🌐 AI 상세페이지 번역기")
 st.write("분할된 상세페이지 이미지를 여러 장 업로드하면 순서대로 번역합니다.")
-st.caption("※ 원본 이미지와 번역문은 서로 다른 영역에 표시되므로 겹치지 않습니다.")
+st.caption("원본 이미지와 번역문은 별도 영역에 표시됩니다. 지금 단계에서는 이미지 위에 번역문을 넣지 않습니다.")
 
 language_map = {
     "러시아어": "Russian",
@@ -36,14 +39,170 @@ uploaded_files = st.file_uploader(
 )
 
 def image_to_base64(uploaded_file):
+    uploaded_file.seek(0)
     image = Image.open(uploaded_file).convert("RGB")
     buffer = io.BytesIO()
     image.save(buffer, format="JPEG", quality=95)
     encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
+    uploaded_file.seek(0)
     return encoded, image
+
+def pil_to_png_bytes(image):
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+def contains_korean(text):
+    return bool(re.search(r"[가-힣]", text))
+
+def detect_korean_lines(image):
+    """
+    Tesseract OCR 결과를 줄(line) 단위로 묶어
+    한국어가 포함된 줄의 위치와 텍스트를 반환합니다.
+    """
+    data = pytesseract.image_to_data(
+        image,
+        lang="kor+eng",
+        config="--oem 1 --psm 11",
+        output_type=Output.DICT,
+    )
+
+    groups = {}
+
+    total = len(data["text"])
+
+    for i in range(total):
+        raw_text = data["text"][i].strip()
+
+        try:
+            conf = float(data["conf"][i])
+        except (ValueError, TypeError):
+            conf = -1
+
+        if not raw_text or conf < 15:
+            continue
+
+        key = (
+            data["block_num"][i],
+            data["par_num"][i],
+            data["line_num"][i],
+        )
+
+        x = int(data["left"][i])
+        y = int(data["top"][i])
+        w = int(data["width"][i])
+        h = int(data["height"][i])
+
+        if key not in groups:
+            groups[key] = {
+                "words": [],
+                "x1": x,
+                "y1": y,
+                "x2": x + w,
+                "y2": y + h,
+                "conf_values": [],
+            }
+
+        groups[key]["words"].append(raw_text)
+        groups[key]["x1"] = min(groups[key]["x1"], x)
+        groups[key]["y1"] = min(groups[key]["y1"], y)
+        groups[key]["x2"] = max(groups[key]["x2"], x + w)
+        groups[key]["y2"] = max(groups[key]["y2"], y + h)
+        groups[key]["conf_values"].append(conf)
+
+    lines = []
+
+    for group in groups.values():
+        text = " ".join(group["words"]).strip()
+
+        if not contains_korean(text):
+            continue
+
+        conf_values = group["conf_values"]
+        avg_conf = sum(conf_values) / len(conf_values) if conf_values else 0
+
+        lines.append(
+            {
+                "text": text,
+                "x": group["x1"],
+                "y": group["y1"],
+                "w": group["x2"] - group["x1"],
+                "h": group["y2"] - group["y1"],
+                "confidence": round(avg_conf, 1),
+            }
+        )
+
+    lines.sort(key=lambda item: (item["y"], item["x"]))
+    return lines
+
+def draw_detection_preview(image, lines):
+    """
+    원본 이미지를 복사해 한국어 OCR 박스만 표시합니다.
+    원본 파일 자체는 수정하지 않습니다.
+    """
+    preview = image.copy()
+    draw = ImageDraw.Draw(preview)
+
+    try:
+        font = ImageFont.truetype(
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            max(16, int(image.width * 0.022)),
+        )
+    except Exception:
+        font = ImageFont.load_default()
+
+    line_width = max(2, int(image.width * 0.004))
+
+    for index, line in enumerate(lines, start=1):
+        x1 = line["x"]
+        y1 = line["y"]
+        x2 = x1 + line["w"]
+        y2 = y1 + line["h"]
+
+        pad = max(3, int(image.width * 0.004))
+
+        x1 = max(0, x1 - pad)
+        y1 = max(0, y1 - pad)
+        x2 = min(image.width, x2 + pad)
+        y2 = min(image.height, y2 + pad)
+
+        draw.rectangle(
+            [x1, y1, x2, y2],
+            outline=(255, 0, 0),
+            width=line_width,
+        )
+
+        label = str(index)
+        label_x = x1
+        label_y = max(0, y1 - max(22, int(image.width * 0.03)))
+
+        bbox = draw.textbbox((label_x, label_y), label, font=font)
+        bg_pad = 3
+
+        draw.rectangle(
+            [
+                bbox[0] - bg_pad,
+                bbox[1] - bg_pad,
+                bbox[2] + bg_pad,
+                bbox[3] + bg_pad,
+            ],
+            fill=(255, 255, 255),
+        )
+
+        draw.text(
+            (label_x, label_y),
+            label,
+            fill=(255, 0, 0),
+            font=font,
+        )
+
+    return preview
 
 if "all_results" not in st.session_state:
     st.session_state.all_results = []
+
+if "ocr_results" not in st.session_state:
+    st.session_state.ocr_results = {}
 
 if uploaded_files:
     st.subheader("업로드된 이미지")
@@ -84,9 +243,9 @@ if uploaded_files:
 [전성분]
 영문 INCI 유지
 5. 화장품 광고 문구는 치료, 완치, 재생 같은 의료적 표현으로 과장하지 마세요.
-6. 설명문은 짧고 자연스럽게 번역하세요.
+6. 원문 의미를 최대한 유지하면서 자연스럽게 번역하세요.
 7. 같은 문구가 반복되어 보이면 한 번만 정리하세요.
-8. 불필요한 설명은 쓰지 말고 번역 결과만 정리하세요.
+8. 불필요한 설명은 쓰지 말고 한국어 원문과 번역 결과만 정리하세요.
 """
 
                 response = client.responses.create(
@@ -122,6 +281,7 @@ if uploaded_files:
                 progress.progress(idx / len(uploaded_files))
 
         st.session_state.all_results = all_results
+        st.session_state.ocr_results = {}
         st.success("✅ 모든 이미지 번역이 완료되었습니다.")
 
 if st.session_state.all_results:
@@ -134,13 +294,52 @@ if st.session_state.all_results:
         st.markdown("---")
         st.subheader(f"{item['index']}번 이미지 · {item['file_name']}")
 
-        st.download_button(
-            label=f"📥 {item['index']}번 원본 번역문 다운로드",
-            data=item["translation"],
-            file_name=f"{item['index']:02d}_translation.txt",
-            mime="text/plain",
-            key=f"download_original_{item['index']}",
-        )
+        top_col1, top_col2 = st.columns(2)
+
+        with top_col1:
+            st.download_button(
+                label=f"📥 {item['index']}번 번역문 다운로드",
+                data=item["translation"],
+                file_name=f"{item['index']:02d}_{item['language']}_translation.txt",
+                mime="text/plain",
+                key=f"download_original_{item['index']}",
+                use_container_width=True,
+            )
+
+        with top_col2:
+            find_boxes = st.button(
+                f"🔎 {item['index']}번 한국어 위치 찾기",
+                key=f"detect_{item['index']}",
+                use_container_width=True,
+            )
+
+        if find_boxes:
+            with st.spinner(
+                f"{item['index']}번 이미지에서 한국어 위치를 찾고 있습니다..."
+            ):
+                try:
+                    lines = detect_korean_lines(item["image"])
+                    preview = draw_detection_preview(item["image"], lines)
+
+                    st.session_state.ocr_results[item["index"]] = {
+                        "lines": lines,
+                        "preview": preview,
+                    }
+
+                    if lines:
+                        st.success(
+                            f"한국어 텍스트 영역 {len(lines)}개를 찾았습니다."
+                        )
+                    else:
+                        st.warning(
+                            "한국어 영역을 찾지 못했습니다. 작은 글자나 장식 글자는 OCR에서 빠질 수 있습니다."
+                        )
+
+                except Exception as exc:
+                    st.error(
+                        "OCR 실행에 실패했습니다. packages.txt에 Tesseract 한국어 언어팩이 설치되어 있는지 확인해 주세요."
+                    )
+                    st.code(str(exc))
 
         col_image, col_text = st.columns([1, 1], gap="large")
 
@@ -164,7 +363,48 @@ if st.session_state.all_results:
                 file_name=f"{item['index']:02d}_{item['language']}_final.txt",
                 mime="text/plain",
                 key=f"download_edit_{item['index']}",
+                use_container_width=True,
             )
+
+        if item["index"] in st.session_state.ocr_results:
+            ocr_data = st.session_state.ocr_results[item["index"]]
+            lines = ocr_data["lines"]
+            preview = ocr_data["preview"]
+
+            st.markdown("### 🔎 한국어 위치 검사 결과")
+            st.caption(
+                "빨간 박스는 OCR이 찾은 한국어 영역입니다. 아직 번역문을 이미지에 넣지 않습니다."
+            )
+
+            preview_col, list_col = st.columns([1.2, 1], gap="large")
+
+            with preview_col:
+                st.image(
+                    preview,
+                    caption="한국어 위치 미리보기",
+                    use_container_width=True,
+                )
+
+                st.download_button(
+                    label="📥 위치 검사 이미지 PNG 다운로드",
+                    data=pil_to_png_bytes(preview),
+                    file_name=f"{item['index']:02d}_ocr_preview.png",
+                    mime="image/png",
+                    key=f"download_ocr_preview_{item['index']}",
+                    use_container_width=True,
+                )
+
+            with list_col:
+                if lines:
+                    for line_index, line in enumerate(lines, start=1):
+                        st.markdown(
+                            f"**{line_index}. {line['text']}**  \n"
+                            f"위치: x={line['x']}, y={line['y']}  \n"
+                            f"크기: {line['w']}×{line['h']}px  \n"
+                            f"OCR 신뢰도: {line['confidence']}"
+                        )
+                else:
+                    st.info("표시할 한국어 OCR 결과가 없습니다.")
 
         combined_text += (
             f"\n\n========== {item['index']}번 이미지 ==========\n"
