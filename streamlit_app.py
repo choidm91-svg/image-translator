@@ -17,7 +17,7 @@ client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
 st.title("🌐 AI 상세페이지 번역기")
 st.write("분할된 상세페이지 이미지를 여러 장 업로드하면 순서대로 번역합니다.")
-st.caption("원본 이미지와 번역문은 별도 영역에 표시됩니다. 지금 단계에서는 이미지 위에 번역문을 넣지 않습니다.")
+st.caption("원본 이미지와 번역문은 별도 영역에 표시됩니다. 영문은 한국어 번역 대상으로 잡지 않도록 이중 OCR 필터를 적용합니다.")
 
 language_map = {
     "러시아어": "Russian",
@@ -55,11 +55,89 @@ def pil_to_png_bytes(image):
 def contains_korean(text):
     return bool(re.search(r"[가-힣]", text))
 
+def count_hangul(text):
+    return len(re.findall(r"[가-힣]", text))
+
+def count_latin(text):
+    return len(re.findall(r"[A-Za-z]", text))
+
+def box_iou(a, b):
+    ax1, ay1 = a["x"], a["y"]
+    ax2, ay2 = ax1 + a["w"], ay1 + a["h"]
+
+    bx1, by1 = b["x"], b["y"]
+    bx2, by2 = bx1 + b["w"], by1 + b["h"]
+
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+
+    iw = max(0, ix2 - ix1)
+    ih = max(0, iy2 - iy1)
+
+    inter = iw * ih
+    area_a = max(1, a["w"] * a["h"])
+    area_b = max(1, b["w"] * b["h"])
+    union = area_a + area_b - inter
+
+    return inter / union if union > 0 else 0
+
+def get_confident_english_boxes(image):
+    """
+    같은 이미지를 영어 OCR로 한 번 더 읽습니다.
+    영어로 자신 있게 읽히는 영역은 한국어 오인식 후보에서 제외합니다.
+    """
+    data = pytesseract.image_to_data(
+        image,
+        lang="eng",
+        config="--oem 1 --psm 11",
+        output_type=Output.DICT,
+    )
+
+    english_boxes = []
+
+    for i, raw in enumerate(data["text"]):
+        text = raw.strip()
+
+        try:
+            conf = float(data["conf"][i])
+        except (ValueError, TypeError):
+            conf = -1
+
+        latin_count = count_latin(text)
+
+        if conf < 55:
+            continue
+
+        if latin_count < 2:
+            continue
+
+        english_boxes.append(
+            {
+                "text": text,
+                "x": int(data["left"][i]),
+                "y": int(data["top"][i]),
+                "w": int(data["width"][i]),
+                "h": int(data["height"][i]),
+                "confidence": conf,
+            }
+        )
+
+    return english_boxes
+
 def detect_korean_lines(image):
     """
-    Tesseract OCR 결과를 줄(line) 단위로 묶어
-    한국어가 포함된 줄의 위치와 텍스트를 반환합니다.
+    한국어 후보를 찾은 뒤,
+    같은 위치가 영어 OCR에서 확실하게 영문으로 읽히면 제거합니다.
+
+    또한 한 글자짜리 한글 후보와 영문 비율이 높은 줄을 제외해
+    PACKAGE / Lifting / NEW / 17Hours 같은 영문이
+    가짜 한글로 잡히는 것을 최대한 방지합니다.
     """
+
+    english_boxes = get_confident_english_boxes(image)
+
     data = pytesseract.image_to_data(
         image,
         lang="kor+eng",
@@ -79,7 +157,7 @@ def detect_korean_lines(image):
         except (ValueError, TypeError):
             conf = -1
 
-        if not raw_text or conf < 15:
+        if not raw_text or conf < 20:
             continue
 
         key = (
@@ -115,22 +193,48 @@ def detect_korean_lines(image):
     for group in groups.values():
         text = " ".join(group["words"]).strip()
 
-        if not contains_korean(text):
+        hangul_count = count_hangul(text)
+        latin_count = count_latin(text)
+        total_letters = hangul_count + latin_count
+
+        if hangul_count == 0:
+            continue
+
+        # 영문을 '후', '비' 같은 한 글자 한글로 잘못 읽는 오탐 차단
+        if hangul_count < 2:
+            continue
+
+        # 실제 한글보다 영문 비율이 더 높은 줄은 한국어 카피로 보지 않음
+        hangul_ratio = hangul_count / max(1, total_letters)
+        if hangul_ratio < 0.45:
+            continue
+
+        candidate = {
+            "text": text,
+            "x": group["x1"],
+            "y": group["y1"],
+            "w": group["x2"] - group["x1"],
+            "h": group["y2"] - group["y1"],
+        }
+
+        # 영어 OCR이 같은 위치를 영문으로 확실하게 읽으면 한국어 후보 제거
+        english_overlap = False
+
+        for eng in english_boxes:
+            if box_iou(candidate, eng) >= 0.30:
+                english_overlap = True
+                break
+
+        if english_overlap:
             continue
 
         conf_values = group["conf_values"]
         avg_conf = sum(conf_values) / len(conf_values) if conf_values else 0
 
-        lines.append(
-            {
-                "text": text,
-                "x": group["x1"],
-                "y": group["y1"],
-                "w": group["x2"] - group["x1"],
-                "h": group["y2"] - group["y1"],
-                "confidence": round(avg_conf, 1),
-            }
-        )
+        candidate["confidence"] = round(avg_conf, 1)
+        candidate["hangul_ratio"] = round(hangul_ratio, 2)
+
+        lines.append(candidate)
 
     lines.sort(key=lambda item: (item["y"], item["x"]))
     return lines
