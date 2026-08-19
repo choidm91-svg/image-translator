@@ -17,7 +17,7 @@ client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
 st.title("🌐 AI 상세페이지 번역기")
 st.write("분할된 상세페이지 이미지를 여러 장 업로드하면 순서대로 번역합니다.")
-st.caption("OCR v4: 줄 영역을 먼저 합친 뒤 재인식하며, 영어 전용 OCR과 비교해 영문 오인식을 제거합니다.")
+st.caption("OCR v5: 작은 한글을 위해 2배 확대 OCR을 추가했고, 글자 크기 필터는 제거했으며, 영문 제외는 영어 전용 OCR 결과만 사용합니다.")
 
 language_map = {
     "러시아어": "Russian",
@@ -252,145 +252,137 @@ def english_coverage(candidate, english_boxes):
     # 겹치는 영어 박스끼리 중복 계산될 수 있으므로 1.0으로 제한
     return min(1.0, covered / candidate_area)
 
+
+def upscale_for_ocr(image, scale=2):
+    """
+    작은 한글을 놓치지 않도록 OCR용으로 이미지를 확대합니다.
+    """
+    if scale == 1:
+        return image
+    w, h = image.size
+    return image.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.Resampling.LANCZOS)
+
+
 def run_korean_candidate_ocr(image):
     """
     한 번의 OCR 패스에서 한국어 후보 라인을 추출합니다.
+    v5에서는 원본 + 2배 확대본을 모두 사용해 작은 한글 누락을 줄입니다.
     """
-    data = pytesseract.image_to_data(
-        image,
-        lang="kor+eng",
-        config="--oem 1 --psm 11",
-        output_type=Output.DICT,
-    )
+    variants = [
+        (image, 1),
+        (upscale_for_ocr(image, 2), 2),
+    ]
 
-    groups = {}
-    total = len(data["text"])
+    all_lines = []
 
-    for i in range(total):
-        raw_text = data["text"][i].strip()
-
-        try:
-            conf = float(data["conf"][i])
-        except (ValueError, TypeError):
-            conf = -1
-
-        if not raw_text or conf < 18:
-            continue
-
-        key = (
-            data["block_num"][i],
-            data["par_num"][i],
-            data["line_num"][i],
+    for variant_image, scale in variants:
+        data = pytesseract.image_to_data(
+            variant_image,
+            lang="kor+eng",
+            config="--oem 1 --psm 11",
+            output_type=Output.DICT,
         )
 
-        x = int(data["left"][i])
-        y = int(data["top"][i])
-        w = int(data["width"][i])
-        h = int(data["height"][i])
+        groups = {}
+        total = len(data["text"])
 
-        if key not in groups:
-            groups[key] = {
-                "words": [],
-                "x1": x,
-                "y1": y,
-                "x2": x + w,
-                "y2": y + h,
-                "conf_values": [],
-            }
+        for i in range(total):
+            raw_text = data["text"][i].strip()
 
-        groups[key]["words"].append(raw_text)
-        groups[key]["x1"] = min(groups[key]["x1"], x)
-        groups[key]["y1"] = min(groups[key]["y1"], y)
-        groups[key]["x2"] = max(groups[key]["x2"], x + w)
-        groups[key]["y2"] = max(groups[key]["y2"], y + h)
-        groups[key]["conf_values"].append(conf)
+            try:
+                conf = float(data["conf"][i])
+            except (ValueError, TypeError):
+                conf = -1
 
-    lines = []
+            if not raw_text or conf < 10:
+                continue
 
-    for group in groups.values():
-        text = re.sub(r"\s+", " ", " ".join(group["words"]).strip())
+            key = (
+                data["block_num"][i],
+                data["par_num"][i],
+                data["line_num"][i],
+            )
 
-        hangul_count = count_hangul(text)
-        latin_count = count_latin(text)
+            x = int(data["left"][i] / scale)
+            y = int(data["top"][i] / scale)
+            w = max(1, int(data["width"][i] / scale))
+            h = max(1, int(data["height"][i] / scale))
 
-        if hangul_count == 0:
-            continue
+            if key not in groups:
+                groups[key] = {
+                    "words": [],
+                    "x1": x,
+                    "y1": y,
+                    "x2": x + w,
+                    "y2": y + h,
+                    "conf_values": [],
+                }
 
-        total_letters = hangul_count + latin_count
-        hangul_ratio = hangul_count / max(1, total_letters)
+            groups[key]["words"].append(raw_text)
+            groups[key]["x1"] = min(groups[key]["x1"], x)
+            groups[key]["y1"] = min(groups[key]["y1"], y)
+            groups[key]["x2"] = max(groups[key]["x2"], x + w)
+            groups[key]["y2"] = max(groups[key]["y2"], y + h)
+            groups[key]["conf_values"].append(conf)
 
-        # 영어를 '후', '비' 등으로 잘못 읽은 짧은 오탐 제거
-        if hangul_count == 1 and len(text.replace(" ", "")) > 1:
-            continue
+        for group in groups.values():
+            line_text = re.sub(r"\s+", " ", " ".join(group["words"]).strip())
+            if not line_text:
+                continue
 
-        # 영문이 대부분인 줄은 한국어 본문이 아님
-        if hangul_ratio < 0.40:
-            continue
+            hangul_count = count_hangul(line_text)
+            latin_count = count_latin(line_text)
 
-        conf_values = group["conf_values"]
-        avg_conf = sum(conf_values) / len(conf_values) if conf_values else 0
+            if hangul_count == 0 and latin_count == 0:
+                continue
 
-        lines.append(
-            {
-                "text": text,
-                "x": group["x1"],
-                "y": group["y1"],
-                "w": group["x2"] - group["x1"],
-                "h": group["y2"] - group["y1"],
-                "confidence": round(avg_conf, 1),
-            }
-        )
+            avg_conf = sum(group["conf_values"]) / max(1, len(group["conf_values"]))
 
-    return lines
+            all_lines.append(
+                {
+                    "text": line_text,
+                    "x": group["x1"],
+                    "y": group["y1"],
+                    "w": max(1, group["x2"] - group["x1"]),
+                    "h": max(1, group["y2"] - group["y1"]),
+                    "confidence": round(avg_conf, 1),
+                }
+            )
+
+    all_lines = deduplicate_boxes(all_lines)
+    all_lines.sort(key=lambda item: (item["y"], item["x"]))
+    return all_lines
+
+
 
 def cluster_line_regions(candidates, image):
     """
     OCR이 한 문장을 여러 박스로 쪼갠 경우를 공간 기준으로 다시 묶습니다.
-    텍스트 자체보다 위치를 우선해 하나의 '줄 영역'을 만듭니다.
+    v5에서는 작은 한글도 놓치지 않기 위해 글자 크기 필터를 제거합니다.
     """
     if not candidates:
         return []
 
-    min_h = max(14, int(image.height * 0.010))
-    cleaned = []
-
-    for item in candidates:
-        w = max(1, item['w'])
-        h = max(1, item['h'])
-
-        # 너무 작은 인쇄문구 / 노이즈 제거
-        if h < min_h:
-            continue
-
-        # 17Hours 같은 세로 영문을 한글로 잘못 읽는 경우 차단
-        if h > w * 1.35 and count_hangul(item.get('text', '')) <= 3:
-            continue
-
-        cleaned.append(item.copy())
-
-    if not cleaned:
-        return []
-
-    # y 중심값 기준으로 줄 후보를 만든다.
-    cleaned.sort(key=lambda x: (x['y'] + x['h'] / 2, x['x']))
+    cleaned = [item.copy() for item in candidates]
+    cleaned.sort(key=lambda x: (x["y"] + x["h"] / 2, x["x"]))
     groups = []
 
     for item in cleaned:
         placed = False
-        item_cy = item['y'] + item['h'] / 2
+        item_cy = item["y"] + item["h"] / 2
 
         for group in groups:
-            gy1 = min(x['y'] for x in group)
-            gy2 = max(x['y'] + x['h'] for x in group)
+            gy1 = min(x["y"] for x in group)
+            gy2 = max(x["y"] + x["h"] for x in group)
             gcy = (gy1 + gy2) / 2
-            avg_h = sum(x['h'] for x in group) / len(group)
+            avg_h = sum(x["h"] for x in group) / len(group)
 
             y_close = abs(item_cy - gcy) <= max(12, avg_h * 0.70)
 
-            gx1 = min(x['x'] for x in group)
-            gx2 = max(x['x'] + x['w'] for x in group)
-            ix1 = item['x']
-            ix2 = item['x'] + item['w']
+            gx1 = min(x["x"] for x in group)
+            gx2 = max(x["x"] + x["w"] for x in group)
+            ix1 = item["x"]
+            ix2 = item["x"] + item["w"]
 
             if ix1 > gx2:
                 gap = ix1 - gx2
@@ -412,19 +404,21 @@ def cluster_line_regions(candidates, image):
     regions = []
 
     for group in groups:
-        x1 = min(x['x'] for x in group)
-        y1 = min(x['y'] for x in group)
-        x2 = max(x['x'] + x['w'] for x in group)
-        y2 = max(x['y'] + x['h'] for x in group)
+        x1 = min(x["x"] for x in group)
+        y1 = min(x["y"] for x in group)
+        x2 = max(x["x"] + x["w"] for x in group)
+        y2 = max(x["y"] + x["h"] for x in group)
 
-        regions.append({
-            'x': x1,
-            'y': y1,
-            'w': x2 - x1,
-            'h': y2 - y1,
-        })
+        regions.append(
+            {
+                "x": x1,
+                "y": y1,
+                "w": x2 - x1,
+                "h": y2 - y1,
+            }
+        )
 
-    regions.sort(key=lambda x: (x['y'], x['x']))
+    regions.sort(key=lambda x: (x["y"], x["x"]))
     return regions
 
 
@@ -461,20 +455,31 @@ def ocr_line_with_conf(image, lang):
     return text, avg_conf
 
 
+
 def best_korean_line_read(crop):
     """
-    원본/명암보정/반전 3종을 한 줄 OCR해서
-    한글 인식이 가장 좋은 결과를 고릅니다.
+    원본/명암보정/반전 + 2배 확대본까지 함께 OCR해서
+    작은 한글 인식률을 높입니다.
     """
     gray = ImageOps.grayscale(crop)
-    contrast = ImageOps.autocontrast(gray).convert('RGB')
-    inverted = ImageOps.invert(ImageOps.autocontrast(gray)).convert('RGB')
+    contrast = ImageOps.autocontrast(gray).convert("RGB")
+    inverted = ImageOps.invert(ImageOps.autocontrast(gray)).convert("RGB")
 
-    variants = [crop.convert('RGB'), contrast, inverted]
+    base_variants = [
+        crop.convert("RGB"),
+        contrast,
+        inverted,
+    ]
+
+    variants = []
+    for variant in base_variants:
+        variants.append(variant)
+        variants.append(upscale_for_ocr(variant, 2))
+
     reads = []
 
     for variant in variants:
-        text, conf = ocr_line_with_conf(variant, 'kor+eng')
+        text, conf = ocr_line_with_conf(variant, "kor+eng")
         h_count = count_hangul(text)
         l_count = count_latin(text)
         ratio = h_count / max(1, h_count + l_count)
@@ -486,55 +491,65 @@ def best_korean_line_read(crop):
     return reads[0][1], reads[0][2], reads[0][3]
 
 
-def is_probably_english_region(crop, korean_text, korean_conf):
+def english_ocr_evidence(crop):
     """
-    동일 crop을 영어 전용 OCR로 재검사합니다.
-    PACKAGE RENEWAL / Lifting / NEW / 17Hours 등은 여기서 제거합니다.
+    영어 전용 OCR 결과를 원본/명암보정/2배 확대본에서 모아
+    영문 여부를 판단할 때만 사용합니다.
     """
-    eng_text, eng_conf = ocr_line_with_conf(crop.convert('RGB'), 'eng')
+    gray = ImageOps.grayscale(crop)
+    contrast = ImageOps.autocontrast(gray).convert("RGB")
 
-    h_count = count_hangul(korean_text)
-    k_latin = count_latin(korean_text)
-    e_latin = count_latin(eng_text)
-    k_ratio = h_count / max(1, h_count + k_latin)
+    variants = [
+        crop.convert("RGB"),
+        contrast,
+        upscale_for_ocr(contrast, 2),
+    ]
 
-    # 영어가 또렷하고 한국어 OCR에는 실제 한글이 거의 없음
-    if e_latin >= 4 and eng_conf >= 55 and h_count <= 1:
+    best = ("", 0.0, 0)
+
+    for variant in variants:
+        text, conf = ocr_line_with_conf(variant, "eng")
+        latin_count = count_latin(text)
+        score = (latin_count * 10) + conf
+
+        if score > ((best[2] * 10) + best[1]):
+            best = (text, conf, latin_count)
+
+    return best
+
+
+def is_probably_english_region(crop):
+    """
+    v5에서는 영어 제외 판단을 영어 전용 OCR 결과만으로 수행합니다.
+    """
+    eng_text, eng_conf, latin_count = english_ocr_evidence(crop)
+
+    cleaned = re.sub(r"[^A-Za-z0-9 ]", "", eng_text).strip()
+
+    if latin_count >= 4 and eng_conf >= 55:
         return True
 
-    # 영어 신뢰도가 훨씬 높고 한글 비율도 낮으면 영문으로 판단
-    if (
-        e_latin >= 4
-        and eng_conf >= 60
-        and eng_conf >= korean_conf + 8
-        and k_ratio < 0.65
-    ):
-        return True
-
-    # 한국어 OCR 결과 자체가 영문 중심이면 제외
-    if k_latin >= 4 and k_ratio < 0.45:
+    if len(cleaned.replace(" ", "")) >= 4 and eng_conf >= 60:
         return True
 
     return False
 
 
+
 def detect_korean_lines(image):
     """
-    OCR v4
+    OCR v5
 
-    - 영문을 한글로 잘못 잡는 문제 완화
-    - 한 문장이 여러 박스로 분리되는 문제 완화
-    - 색 배경 위 흰색 한글 보완
-    - 작은 패키지 인쇄문구/세로 영문 노이즈 제거
-
-    핵심은 'OCR 박스 그대로 사용'하지 않고,
-    먼저 줄 영역을 합친 뒤 그 줄을 다시 OCR하는 것입니다.
+    - 작은 한글을 놓치지 않도록 원본 + 2배 확대 OCR 추가
+    - 글자 크기 필터 제거
+    - 영문 제외는 영어 전용 OCR 결과만 사용
+    - 한 문장이 여러 박스로 분리되면 줄 단위로 다시 OCR
     """
     # 1) 원본 + 반전에서 후보 위치 수집
     candidates = run_korean_candidate_ocr(image)
 
     gray = ImageOps.grayscale(image)
-    inverted = ImageOps.invert(ImageOps.autocontrast(gray)).convert('RGB')
+    inverted = ImageOps.invert(ImageOps.autocontrast(gray)).convert("RGB")
     candidates.extend(run_korean_candidate_ocr(inverted))
 
     # 2) 중복 후보를 정리하고 같은 줄을 공간 기준으로 묶기
@@ -546,56 +561,47 @@ def detect_korean_lines(image):
     pad_y = max(5, int(image.height * 0.004))
 
     for region in regions:
-        x1 = max(0, region['x'] - pad_x)
-        y1 = max(0, region['y'] - pad_y)
-        x2 = min(image.width, region['x'] + region['w'] + pad_x)
-        y2 = min(image.height, region['y'] + region['h'] + pad_y)
+        x1 = max(0, region["x"] - pad_x)
+        y1 = max(0, region["y"] - pad_y)
+        x2 = min(image.width, region["x"] + region["w"] + pad_x)
+        y2 = min(image.height, region["y"] + region["h"] + pad_y)
 
-        crop = image.crop((x1, y1, x2, y2)).convert('RGB')
+        crop = image.crop((x1, y1, x2, y2)).convert("RGB")
 
         # 3) 합쳐진 줄 영역을 다시 한 줄 OCR
         korean_text, korean_conf, best_variant = best_korean_line_read(crop)
-        korean_text = re.sub(r'\s+', ' ', korean_text).strip()
+        korean_text = re.sub(r"\s+", " ", korean_text).strip()
 
         h_count = count_hangul(korean_text)
-        l_count = count_latin(korean_text)
 
         if h_count == 0:
             continue
 
-        # 한 글자 오탐은 기본 제외. '전/후'는 예외로 허용 가능
-        allowed_single = {'전', '후'}
+        # 한 글자 오탐은 기본 제외. '전/후'는 예외로 허용
+        allowed_single = {"전", "후"}
         if h_count == 1 and korean_text not in allowed_single:
             continue
 
-        # 4) 같은 crop을 영어 OCR로 비교해 영문 오인식 제거
-        if is_probably_english_region(crop, korean_text, korean_conf):
+        # 4) 영어 전용 OCR 결과만으로 영문 제외
+        if is_probably_english_region(crop):
             continue
 
-        # 5) 제품 패키지의 아주 작은 인쇄문구를 최소 크기로 한 번 더 걸러냄
-        min_final_h = max(15, int(image.height * 0.012))
-        if region['h'] < min_final_h and h_count <= 5:
-            continue
+        final_lines.append(
+            {
+                "text": korean_text,
+                "x": region["x"],
+                "y": region["y"],
+                "w": region["w"],
+                "h": region["h"],
+                "confidence": round(korean_conf, 1),
+            }
+        )
 
-        # 한글보다 영어가 지나치게 많은 줄은 본문 카피로 보지 않음
-        hangul_ratio = h_count / max(1, h_count + l_count)
-        if hangul_ratio < 0.38:
-            continue
-
-        final_lines.append({
-            'text': korean_text,
-            'x': region['x'],
-            'y': region['y'],
-            'w': region['w'],
-            'h': region['h'],
-            'confidence': round(korean_conf, 1),
-            'hangul_ratio': round(hangul_ratio, 2),
-        })
-
-    # 6) 최종 중복 제거
+    # 5) 최종 중복 제거
     final_lines = deduplicate_boxes(final_lines)
-    final_lines.sort(key=lambda item: (item['y'], item['x']))
+    final_lines.sort(key=lambda item: (item["y"], item["x"]))
     return final_lines
+
 
 def draw_detection_preview(image, lines):
     """
