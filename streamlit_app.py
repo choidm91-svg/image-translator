@@ -6,6 +6,7 @@ from pytesseract import Output
 import base64
 import io
 import re
+from card_maker import make_card, make_zip
 
 st.set_page_config(
     page_title="AI 상세페이지 번역기",
@@ -15,8 +16,10 @@ st.set_page_config(
 
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
-st.title("🌐 AI 상세페이지 번역기")
-st.write("분할된 상세페이지 이미지를 여러 장 업로드하면 순서대로 번역합니다.")
+tool_mode = st.sidebar.radio("작업 선택", ["🌐 상세페이지 번역", "🧩 쇼피 카드 만들기"])
+if tool_mode == "🌐 상세페이지 번역":
+    st.title("🌐 AI 상세페이지 번역기")
+    st.write("분할된 상세페이지 이미지를 여러 장 업로드하면 순서대로 번역합니다.")
 st.caption("OCR v5: 작은 한글을 위해 2배 확대 OCR을 추가했고, 글자 크기 필터는 제거했으며, 영문 제외는 영어 전용 OCR 결과만 사용합니다.")
 
 language_map = {
@@ -897,3 +900,64 @@ if st.session_state.all_results:
         mime="text/plain",
         key="download_all",
     )
+
+
+st.markdown("---")
+st.header("🧩 Shopee Card Maker · PRODUCT LOCK 🔒")
+st.caption("업로드한 제품 이미지는 AI로 다시 그리지 않습니다. 비율을 잠근 채 원본 전체를 축소·배치만 합니다.")
+
+with st.expander("🔒 PRODUCT LOCK 규칙", expanded=True):
+    st.write("• 제품/라벨/로고 재생성 금지")
+    st.write("• 제품 색상 변경 금지")
+    st.write("• 가로·세로 비율 변형 금지")
+    st.write("• 원본 전체 크롭 금지")
+    st.write("• 허용: 동일 비율 축소 + 위치 이동 + 별도 배경/텍스트")
+
+product_upload = st.file_uploader("제품 누끼 PNG (권장)", type=["png","jpg","jpeg"], key="card_product")
+card_mode = st.radio("카드 스타일", ["Overseas","K-Beauty"], horizontal=True, key="card_mode")
+
+cc1,cc2 = st.columns(2)
+with cc1:
+    product_name = st.text_input("제품명","Skin Barrier Cica B5 Ampoule",key="c_product")
+    main_number = st.text_input("메인 숫자","91%",key="c_main_number")
+    main_claim = st.text_input("메인 문구","Active Ingredients",key="c_main_claim")
+    ing1_name = st.text_input("성분 1","Cica",key="c_i1n")
+    ing1_value = st.text_input("성분 1 함량","83%",key="c_i1v")
+    ing1_claim = st.text_input("성분 1 광고 문구","Soothing Care",key="c_i1c")
+with cc2:
+    ing2_name = st.text_input("성분 2","Panthenol",key="c_i2n")
+    ing2_value = st.text_input("성분 2 함량","8%",key="c_i2v")
+    ing2_claim = st.text_input("성분 2 광고 문구","Deep Hydration",key="c_i2c")
+    benefits = st.text_input("3가지 효과 (쉼표 구분)","Soothe, Hydrate, Strengthen",key="c_benefits")
+    texture = st.text_input("사용감","Lightweight · Moist · Non-sticky",key="c_texture")
+    test_value = st.text_input("시험 수치","0.00",key="c_test")
+    test_label = st.text_input("시험명","Skin Irritation Index",key="c_testlabel")
+    volume = st.text_input("용량","30 mL / 1.01 fl. oz.",key="c_volume")
+
+if st.button("✨ PRODUCT LOCK으로 9장 생성", type="primary", key="make_cards"):
+    if not product_upload:
+        st.error("제품 이미지를 먼저 올려주세요.")
+    else:
+        product_upload.seek(0)
+        locked_product = Image.open(product_upload).convert("RGBA")
+        benefit_list=[x.strip() for x in benefits.split(",") if x.strip()]
+        while len(benefit_list)<3:
+            benefit_list.append("")
+        card_data={
+            "product_name":product_name,"main_number":main_number,"main_claim":main_claim,
+            "ing1_name":ing1_name,"ing1_value":ing1_value,"ing1_claim":ing1_claim,
+            "ing2_name":ing2_name,"ing2_value":ing2_value,"ing2_claim":ing2_claim,
+            "benefits":benefit_list[:3],"texture":texture,"test_value":test_value,
+            "test_label":test_label,"volume":volume
+        }
+        st.session_state["locked_cards"]=[make_card(i,card_data,locked_product,card_mode) for i in range(1,10)]
+        st.success("9장 생성 완료. 제품은 PRODUCT LOCK 방식으로 합성되었습니다.")
+
+if "locked_cards" in st.session_state:
+    cols=st.columns(3)
+    for idx,card in enumerate(st.session_state["locked_cards"],1):
+        with cols[(idx-1)%3]:
+            st.image(card,caption=f"{idx:02d} · 1024×1024",use_container_width=True)
+            bb=io.BytesIO(); card.save(bb,"PNG")
+            st.download_button(f"{idx:02d}.png 다운로드",bb.getvalue(),f"{idx:02d}.png","image/png",key=f"dl_card_{idx}")
+    st.download_button("📦 PNG 9장 ZIP 다운로드",make_zip(st.session_state["locked_cards"]),"shopee_cards_9.zip","application/zip",use_container_width=True)
