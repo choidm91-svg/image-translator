@@ -6,7 +6,6 @@ from pytesseract import Output
 import base64
 import io
 import re
-from card_maker import card, zip_cards
 
 st.set_page_config(
     page_title="AI 상세페이지 번역기",
@@ -898,43 +897,3 @@ if st.session_state.all_results:
         mime="text/plain",
         key="download_all",
     )
-
-
-st.markdown("---")
-st.header("🧩 쇼피 카드 메이커 V2 · PRODUCT LOCK 🔒")
-st.caption("한글/영문 상세페이지를 올려 참고하고, 제품 원본 PNG는 재생성하지 않고 그대로 합성합니다.")
-
-kr_pages=st.file_uploader("① 한글 상세페이지",type=["pdf","png","jpg","jpeg"],accept_multiple_files=True,key="v2kr")
-en_pages=st.file_uploader("② 영문 상세페이지",type=["pdf","png","jpg","jpeg"],accept_multiple_files=True,key="v2en")
-prod=st.file_uploader("③ 제품 원본 PNG 🔒",type=["png"],key="v2prod")
-style=st.radio("④ 스타일",["해외형","K-Beauty형"],horizontal=True,key="v2style")
-
-st.warning("광고 수치와 문구는 생성 전에 직접 확인하세요. 제품 PNG의 로고·라벨·색상·비율은 변경하지 않습니다.")
-
-c1,c2=st.columns(2)
-with c1:
-    main_number=st.text_input("메인 수치","91%",key="v2mn")
-    main_claim=st.text_input("메인 카피","Active Ingredients",key="v2mc")
-    ing1=st.text_input("성분 1","Cica",key="v2i1");v1=st.text_input("함량 1","83%",key="v2v1")
-    claim1=st.text_input("성분 1 포인트","Soothing Care",key="v2c1")
-with c2:
-    ing2=st.text_input("성분 2","Panthenol",key="v2i2");v2=st.text_input("함량 2","8%",key="v2v2")
-    claim2=st.text_input("성분 2 포인트","Deep Hydration",key="v2c2")
-    bens=st.text_input("효과 3개","Soothe, Hydrate, Strengthen",key="v2b")
-    texture=st.text_input("사용감","Lightweight · Moist · Non-sticky",key="v2t")
-    test=st.text_input("시험 수치","0.00",key="v2test");test_label=st.text_input("시험명","Skin Irritation Index",key="v2tl")
-
-if st.button("✨ 1024×1024 카드 9장 생성",type="primary",key="v2make"):
-    if not prod: st.error("제품 원본 PNG를 올려주세요.")
-    else:
-        prod.seek(0);p=Image.open(prod).convert("RGBA")
-        benefits=[x.strip() for x in bens.split(",")][:3]
-        while len(benefits)<3: benefits.append("")
-        d={"main_number":main_number,"main_claim":main_claim,"ing1":ing1,"v1":v1,"claim1":claim1,"ing2":ing2,"v2":v2,"claim2":claim2,"benefits":benefits,"texture":texture,"test":test,"test_label":test_label}
-        st.session_state["v2cards"]=[card(i,d,p,style) for i in range(1,10)]
-
-if "v2cards" in st.session_state:
-    cols=st.columns(3)
-    for i,im in enumerate(st.session_state["v2cards"],1):
-        with cols[(i-1)%3]: st.image(im,caption=f"{i:02d} · 1024×1024",use_container_width=True)
-    st.download_button("📦 9장 ZIP 다운로드",zip_cards(st.session_state["v2cards"]),"shopee_cards_v2.zip","application/zip",use_container_width=True)
