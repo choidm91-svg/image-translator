@@ -1,903 +1,899 @@
-import base64
-import io
-import json
-import re
-from typing import Dict, List
-
 import streamlit as st
 from openai import OpenAI
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont, ImageOps
+import pytesseract
+from pytesseract import Output
+import base64
+import io
+import re
 
 st.set_page_config(
-    page_title="AI 상세페이지 번역기 v11.7",
+    page_title="AI 상세페이지 번역기",
     page_icon="🌐",
     layout="wide",
 )
 
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
-# ------------------------------------------------------------
-# 시장 / 언어 프리셋
-# ------------------------------------------------------------
-MARKET_LANGUAGE = {
-    "러시아": "Russian",
-    "미국": "American English",
-    "영국": "British English",
-    "글로벌 영어권": "International English",
-    "일본": "Japanese",
-    "중국 본토": "Simplified Chinese",
-    "대만": "Traditional Chinese",
-    "베트남": "Vietnamese",
-    "프랑스": "French",
-    "스페인": "Spanish (Spain)",
-    "멕시코": "Spanish (Mexico)",
-    "라틴아메리카": "Neutral Latin American Spanish",
+st.title("🌐 AI 상세페이지 번역기")
+st.write("분할된 상세페이지 이미지를 여러 장 업로드하면 순서대로 번역합니다.")
+st.caption("OCR v5: 작은 한글을 위해 2배 확대 OCR을 추가했고, 글자 크기 필터는 제거했으며, 영문 제외는 영어 전용 OCR 결과만 사용합니다.")
+
+language_map = {
+    "러시아어": "Russian",
+    "영어": "English",
+    "일본어": "Japanese",
+    "중국어": "Chinese",
+    "베트남어": "Vietnamese",
 }
 
-MARKET_DISPLAY_LANGUAGE = {
-    "러시아": "러시아어",
-    "미국": "영어",
-    "영국": "영어",
-    "글로벌 영어권": "영어",
-    "일본": "일본어",
-    "중국 본토": "중국어(간체)",
-    "대만": "중국어(번체)",
-    "베트남": "베트남어",
-    "프랑스": "프랑스어",
-    "스페인": "스페인어",
-    "멕시코": "스페인어",
-    "라틴아메리카": "스페인어",
-}
-
-MARKET_RULES = {
-    "러시아": """
-- 러시아 화장품 상세페이지에서 자연스럽게 쓰는 간결한 표현을 사용하세요.
-- 절대적 안전 보장(완전히 안전, 자극 없음, 누구나 안심)을 만들지 마세요.
-- 시험 결과는 시험 범위 안에서만 표현하세요.
-- 치료·치유·의학적 재생처럼 의약품으로 오인될 수 있는 표현은 보습, 컨디셔닝, 외관 개선 중심으로 순화하세요.
-""",
-    "미국": """
-- 미국 화장품 카피처럼 짧고 자연스럽게 작성하세요.
-- 질환 치료/예방, 신체 구조·기능 변화처럼 보이는 drug claim은 피하세요.
-- cure, treat, heal, regenerate, 100% safe 같은 절대 표현을 사용하지 마세요.
-- appearance, feel, helps, visibly 같은 화장품 범위 표현을 우선하세요.
-""",
-    "영국": """
-- 자연스러운 British English 화장품 카피로 작성하세요.
-- medicinal/therapeutic claim처럼 보일 수 있는 치료·치유·질환 예방 표현을 피하세요.
-- 외관, 사용감, 보습 중심으로 보수적으로 표현하세요.
-""",
-    "글로벌 영어권": """
-- 자연스러운 International English를 사용하세요.
-- 치료·치유·질환 예방·절대 안전 보장 표현을 피하세요.
-- helps, visibly, appearance of, feels 같은 화장품 범위 표현을 우선하세요.
-""",
-    "일본": """
-- 일본 화장품 상세페이지에서 자연스러운 짧은 카피로 현지화하세요.
-- 의약부외품 근거가 없는 한 치료·치유·재생을 단정하지 마세요.
-- 肌を整える, うるおいを与える, ハリ感, 乾燥を防ぐ 같은 화장품 범위 표현을 우선하세요.
-""",
-    "중국 본토": """
-- 중국 본토 소비자에게 자연스러운 간체 중국어 화장품 카피를 사용하세요.
-- 第一, 最, 100%有效, 绝对安全, 零刺激 같은 절대적·최상급 표현을 피하세요.
-- 치료·의학적 효능보다 보습, 컨디셔닝, 외관 개선 중심으로 표현하세요.
-""",
-    "대만": """
-- 대만 화장품 상세페이지에 자연스러운 번체 중국어로 현지화하세요.
-- 치료, 치유, 의학적 재생을 단정하지 말고 保濕、調理肌膚、維持肌膚狀態、改善外觀 중심으로 표현하세요.
-- 절대적 안전·효능 보장을 피하세요.
-""",
-    "베트남": """
-- 베트남 화장품 상세페이지에 맞는 짧고 자연스러운 문장으로 현지화하세요.
-- 치료·치유·염증 개선·의학적 재생을 단정하지 마세요.
-- an toàn tuyệt đối, không gây kích ứng 100% 같은 절대적 안전 보장을 피하세요.
-""",
-    "프랑스": """
-- 프랑스 화장품 상세페이지처럼 짧고 자연스럽게 작성하세요.
-- médicament처럼 보일 수 있는 치료·치유·질환 예방 표현을 피하세요.
-- hydratation, confort, apparence, peau visiblement plus lisse 같은 화장품 범위 표현을 우선하세요.
-""",
-    "스페인": """
-- 스페인 소비자에게 자연스러운 유럽 스페인어 화장품 카피로 현지화하세요.
-- 치료·치유·질환 예방 표현을 피하고 hidratación, confort, apariencia 중심으로 표현하세요.
-""",
-    "멕시코": """
-- 멕시코 화장품 상세페이지에 자연스러운 스페인어를 사용하세요.
-- 치료·치유·의학적 재생을 단정하지 마세요.
-- 100% seguro, sin irritación, cura 같은 절대적·치료성 표현을 피하세요.
-""",
-    "라틴아메리카": """
-- 중립적인 라틴아메리카 스페인어를 사용하세요.
-- 치료·치유·질환 예방처럼 의약품으로 오인될 수 있는 표현을 피하세요.
-- hidratación, cuidado, confort, apariencia de la piel 중심으로 표현하세요.
-""",
-}
-
-# ------------------------------------------------------------
-# UI
-# ------------------------------------------------------------
-st.title("🌐 AI 상세페이지 번역기 v11.7")
-st.caption(
-    "원클릭 실무 모드: 국가 선택 → 번역 → 검수 필요한 문장만 확인 → 전체 다운로드"
+selected_language = st.selectbox(
+    "번역할 언어를 선택하세요",
+    ["러시아어", "영어", "일본어", "중국어", "베트남어"],
 )
-st.success("✅ v11.7 AUTO-SPLIT · NO-OCR · 긴 상세페이지는 자동 분할해서 번역합니다")
-
-selected_market = st.selectbox(
-    "판매 국가 / 시장",
-    list(MARKET_LANGUAGE.keys()),
-    index=0,
-)
-
-target_language = MARKET_LANGUAGE[selected_market]
-display_language = MARKET_DISPLAY_LANGUAGE[selected_market]
-
-with st.expander("고급 설정", expanded=False):
-    safety_mode = st.checkbox(
-        "현지 화장품 광고 표현을 보수적으로 순화",
-        value=True,
-    )
-    short_mode = st.checkbox(
-        "디자인용 짧은 번역",
-        value=True,
-    )
-    st.caption("기본값 그대로 사용해도 됩니다.")
-
-st.info(
-    f"현재 프리셋: **{selected_market} / {display_language}** · 광고 표현 순화 + 디자인용 짧은 번역"
-)
-
-# 고정 번역 사전
-if "translation_dictionary" not in st.session_state:
-    st.session_state.translation_dictionary = {}
-
-with st.expander("📘 고정 번역 사전", expanded=False):
-    st.caption(
-        "한 번 확정한 표현을 계속 같은 번역으로 사용합니다. "
-        "형식: 한국어 = 번역문 (한 줄에 하나)"
-    )
-    default_dict_text = "\n".join(
-        f"{k} = {v}" for k, v in st.session_state.translation_dictionary.items()
-    )
-    dictionary_text = st.text_area(
-        "고정 번역",
-        value=default_dict_text,
-        height=160,
-        placeholder="피부 저자극 테스트 완료 = Пройден тест на низкий потенциал раздражения кожи\n전성분 = 영문 INCI 유지",
-        key="dictionary_editor",
-    )
-
-    parsed_dictionary = {}
-    for line in dictionary_text.splitlines():
-        if "=" not in line:
-            continue
-        source, target = line.split("=", 1)
-        source = source.strip()
-        target = target.strip()
-        if source and target:
-            parsed_dictionary[source] = target
-    st.session_state.translation_dictionary = parsed_dictionary
-
-    dict_json = json.dumps(parsed_dictionary, ensure_ascii=False, indent=2)
-    st.download_button(
-        "📥 번역 사전 JSON 다운로드",
-        data=dict_json,
-        file_name=f"translation_dictionary_{selected_market}.json",
-        mime="application/json",
-        use_container_width=True,
-    )
 
 uploaded_files = st.file_uploader(
-    "상세페이지 JPG / PNG 이미지를 여러 장 업로드하세요",
+    "분할된 JPG 또는 PNG 이미지를 여러 장 올려주세요",
     type=["jpg", "jpeg", "png"],
     accept_multiple_files=True,
 )
 
-# ------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------
-def image_to_data_url(uploaded_file):
+def image_to_base64(uploaded_file):
     uploaded_file.seek(0)
     image = Image.open(uploaded_file).convert("RGB")
     buffer = io.BytesIO()
     image.save(buffer, format="JPEG", quality=95)
     encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
     uploaded_file.seek(0)
-    return f"data:image/jpeg;base64,{encoded}", image
+    return encoded, image
 
-
-
-
-def pil_to_data_url(image: Image.Image):
+def pil_to_png_bytes(image):
     buffer = io.BytesIO()
-    image.convert("RGB").save(buffer, format="JPEG", quality=94)
-    encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
-    return f"data:image/jpeg;base64,{encoded}"
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
 
+def contains_korean(text):
+    return bool(re.search(r"[가-힣]", text))
 
-def split_tall_image(image: Image.Image, max_height: int = 6000, overlap: int = 450):
+def count_hangul(text):
+    return len(re.findall(r"[가-힣]", text))
+
+def count_latin(text):
+    return len(re.findall(r"[A-Za-z]", text))
+
+def intersection_area(a, b):
+    ax1, ay1 = a["x"], a["y"]
+    ax2, ay2 = ax1 + a["w"], ay1 + a["h"]
+
+    bx1, by1 = b["x"], b["y"]
+    bx2, by2 = bx1 + b["w"], by1 + b["h"]
+
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+
+    iw = max(0, ix2 - ix1)
+    ih = max(0, iy2 - iy1)
+
+    return iw * ih
+
+def box_iou(a, b):
+    inter = intersection_area(a, b)
+
+    area_a = max(1, a["w"] * a["h"])
+    area_b = max(1, b["w"] * b["h"])
+
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0
+
+def overlap_ratio_of_candidate(candidate, other):
     """
-    세로로 매우 긴 상세페이지를 자동 분할합니다.
-    각 조각은 450px 정도 겹치게 잘라 경계에 걸린 문장 누락을 줄입니다.
+    candidate 영역 중 other 박스가 얼마나 덮는지 계산합니다.
+    PACKAGE RENEWAL처럼 영어 단어가 여러 조각으로 나뉘어도
+    후보 영역을 많이 덮으면 영문으로 판단할 수 있게 합니다.
     """
-    width, height = image.size
+    inter = intersection_area(candidate, other)
+    area_candidate = max(1, candidate["w"] * candidate["h"])
+    return inter / area_candidate
 
-    if height <= max_height:
-        return [
-            {
-                "index": 1,
-                "y1": 0,
-                "y2": height,
-                "image": image,
-            }
-        ]
+def vertical_overlap_ratio(a, b):
+    ay1, ay2 = a["y"], a["y"] + a["h"]
+    by1, by2 = b["y"], b["y"] + b["h"]
 
-    chunks = []
-    y1 = 0
-    index = 1
+    overlap = max(0, min(ay2, by2) - max(ay1, by1))
+    return overlap / max(1, min(a["h"], b["h"]))
 
-    while y1 < height:
-        y2 = min(height, y1 + max_height)
-        crop = image.crop((0, y1, width, y2)).convert("RGB")
-        chunks.append(
-            {
-                "index": index,
-                "y1": y1,
-                "y2": y2,
-                "image": crop,
-            }
+def horizontal_gap(a, b):
+    if a["x"] <= b["x"]:
+        return b["x"] - (a["x"] + a["w"])
+    return a["x"] - (b["x"] + b["w"])
+
+def merge_two_boxes(a, b):
+    x1 = min(a["x"], b["x"])
+    y1 = min(a["y"], b["y"])
+    x2 = max(a["x"] + a["w"], b["x"] + b["w"])
+    y2 = max(a["y"] + a["h"], b["y"] + b["h"])
+
+    if a["x"] <= b["x"]:
+        merged_text = (a["text"].rstrip() + " " + b["text"].lstrip()).strip()
+    else:
+        merged_text = (b["text"].rstrip() + " " + a["text"].lstrip()).strip()
+
+    return {
+        "text": re.sub(r"\s+", " ", merged_text),
+        "x": x1,
+        "y": y1,
+        "w": x2 - x1,
+        "h": y2 - y1,
+        "confidence": round(
+            (float(a.get("confidence", 0)) + float(b.get("confidence", 0))) / 2,
+            1,
+        ),
+    }
+
+def merge_same_line_boxes(lines, image_width):
+    """
+    같은 줄인데 OCR이 '습니다', '니다', '제'처럼 여러 박스로
+    쪼갠 결과를 하나의 문장 박스로 합칩니다.
+    """
+    if not lines:
+        return []
+
+    lines = sorted(lines, key=lambda item: (item["y"], item["x"]))
+    merged = []
+
+    for current in lines:
+        if not merged:
+            merged.append(current.copy())
+            continue
+
+        previous = merged[-1]
+
+        v_overlap = vertical_overlap_ratio(previous, current)
+        gap = horizontal_gap(previous, current)
+
+        avg_h = (previous["h"] + current["h"]) / 2
+        max_gap = max(
+            35,
+            int(avg_h * 3.2),
+            int(image_width * 0.045),
         )
 
-        if y2 >= height:
-            break
-
-        y1 = max(0, y2 - overlap)
-        index += 1
-
-    return chunks
-
-
-def merge_chunk_segments(segment_groups):
-    """
-    자동 분할 조각의 겹치는 영역에서 동일 문구가 두 번 잡히는 것을 제거합니다.
-    조각 순서를 그대로 유지합니다.
-    """
-    merged = []
-    seen = set()
-
-    for group in segment_groups:
-        for seg in group:
-            key = normalize_key(seg.get("korean", ""))
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            merged.append(dict(seg))
-
-    for idx, seg in enumerate(merged, start=1):
-        seg["order"] = idx
+        # 같은 줄 + 간격이 가까우면 하나의 문장으로 병합
+        if v_overlap >= 0.55 and -20 <= gap <= max_gap:
+            merged[-1] = merge_two_boxes(previous, current)
+        else:
+            merged.append(current.copy())
 
     return merged
 
-def clean_json_text(text):
-    text = (text or "").strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
-    return text.strip()
-
-
-def parse_json_response(text):
-    cleaned = clean_json_text(text)
-    try:
-        return json.loads(cleaned)
-    except Exception:
-        pass
-    match = re.search(r"\{.*\}", cleaned, re.S)
-    if match:
-        try:
-            return json.loads(match.group(0))
-        except Exception:
-            return None
-    return None
-
-
-def normalize_key(text):
-    return re.sub(r"[^가-힣A-Za-z0-9]", "", (text or "").lower())
-
-
-def extract_numbers(text):
-    return re.findall(r"\d+(?:[.,]\d+)?%?|\d+(?:[.,]\d+)?", text or "")
-
-
-def visual_units(text):
-    """디자인 길이 비교용 간단한 시각 폭 추정치."""
-    units = 0.0
-    for ch in text or "":
-        if ch == "\n":
-            continue
-        if re.match(r"[가-힣一-龥ぁ-んァ-ン]", ch):
-            units += 1.0
-        elif ch.isspace():
-            units += 0.35
-        elif ch.isdigit():
-            units += 0.55
-        else:
-            units += 0.55
-    return max(1.0, units)
-
-
-def length_check(korean, translation, seg_type):
-    source = visual_units(korean)
-    target = visual_units(translation)
-    ratio = target / source
-
-    if seg_type in {"headline", "label"}:
-        limit = 1.35
-    elif seg_type in {"footnote", "test_value"}:
-        limit = 1.60
-    else:
-        limit = 1.50
-
-    return {
-        "ratio": round(ratio, 2),
-        "limit": limit,
-        "too_long": ratio > limit,
-    }
-
-
-def apply_dictionary(korean, translation, dictionary):
-    # 완전 일치 우선
-    if korean in dictionary:
-        return dictionary[korean], True
-
-    # 짧은 고정 용어가 문장에 포함되어 있으면 번역문 전체를 억지 치환하지 않음.
-    return translation, False
-
-
-def deduplicate_segments(segments):
-    seen = set()
+def deduplicate_boxes(lines):
+    """
+    원본/반전 OCR을 동시에 돌렸을 때 같은 문구가 중복 검출되는 것을 제거합니다.
+    """
     result = []
-    for seg in segments:
-        key = normalize_key(seg.get("korean", ""))
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        result.append(seg)
-    for idx, seg in enumerate(result, start=1):
-        seg["order"] = idx
+
+    for line in sorted(lines, key=lambda item: (item["y"], item["x"])):
+        duplicate_index = None
+
+        for idx, existing in enumerate(result):
+            if box_iou(line, existing) >= 0.55:
+                duplicate_index = idx
+                break
+
+        if duplicate_index is None:
+            result.append(line)
+        else:
+            existing = result[duplicate_index]
+
+            # 더 긴 한국어 문장을 우선 사용
+            if count_hangul(line["text"]) > count_hangul(existing["text"]):
+                result[duplicate_index] = line
+            elif line.get("confidence", 0) > existing.get("confidence", 0):
+                result[duplicate_index] = line
+
     return result
 
-
-def build_dictionary_prompt(dictionary):
-    if not dictionary:
-        return "고정 번역 사전 없음"
-    lines = [f"- {k} => {v}" for k, v in dictionary.items()]
-    return "\n".join(lines)
-
-
-def is_meta_commentary_segment(korean, translation):
-    """AI가 이미지 속 문구가 아니라 해상도/판독 안내문을 만들어낸 경우 제거합니다."""
-    combined = f"{korean} {translation}".lower()
-    patterns = [
-        "이미지 해상도",
-        "해상도가 너무 낮",
-        "문자 식별이 어렵",
-        "고해상도 이미지",
-        "텍스트가 선명",
-        "이미지를 다시",
-        "업로드해",
-        "resolution is too low",
-        "low resolution",
-        "upload a higher",
-    ]
-    return any(pattern.lower() in combined for pattern in patterns)
-
-
-def scrub_false_resolution_reason(reason, image_width):
-    """가로 800px 이상이면 AI가 추측한 '저해상도' 검수 사유를 제거합니다."""
-    reason = str(reason or "").strip()
-    if image_width < 800:
-        return reason
-
-    low_res_terms = [
-        "해상도",
-        "저해상도",
-        "고해상도",
-        "resolution",
-    ]
-    if any(term.lower() in reason.lower() for term in low_res_terms):
-        return ""
-    return reason
-
-
-def translate_detail_image(image_url, image_width, image_height, target_language, target_market, dictionary, safety_mode, short_mode):
-    safety_instruction = (
-        "치료, 완치, 재생, 의약품 효능처럼 보이는 표현은 원문 의미를 유지하는 범위에서만 보수적으로 순화하세요. "
-        "시험 결과를 일반적인 안전성 보장이나 의학적 효능으로 확대하지 마세요."
-        if safety_mode
-        else "원문 의미를 최대한 그대로 유지하세요."
+def get_confident_english_boxes(image):
+    """
+    영어 전용 OCR 결과를 수집합니다.
+    실제 영문을 한국어로 오인한 후보를 제거하는 데 사용합니다.
+    """
+    data = pytesseract.image_to_data(
+        image,
+        lang="eng",
+        config="--oem 1 --psm 11",
+        output_type=Output.DICT,
     )
 
-    concise_instruction = (
-        """
-디자인용 길이 규칙:
-- headline / label: 최대한 한 줄, 짧게.
-- body: 핵심 정보만 유지해 1~2개의 짧은 문장.
-- footnote / test_value: 가장 짧고 명확하게.
-- 번역문이 한국어보다 지나치게 길어지지 않게 하세요.
-- 긴 경우 의미를 보존하면서 더 짧은 현지 표현을 우선하세요.
-"""
-        if short_mode
-        else ""
-    )
+    english_boxes = []
 
-    dictionary_prompt = build_dictionary_prompt(dictionary)
+    for i, raw in enumerate(data["text"]):
+        text = raw.strip()
 
-    prompt = f"""
-이 이미지는 한국 화장품 상세페이지입니다.
-실제 업로드 이미지 크기는 가로 {image_width}px × 세로 {image_height}px 입니다.
-이미지 크기는 이미 앱이 직접 측정했으므로 해상도를 추측하지 마세요.
-가로가 800px 이상이면 절대로 "해상도가 낮다"거나 "고해상도 이미지를 다시 업로드하라"는 안내를 만들지 마세요.
-판독이 어려운 일부 문구가 있더라도 읽을 수 있는 한국어만 추출하고, 이미지 품질에 대한 설명은 출력하지 마세요.
+        try:
+            conf = float(data["conf"][i])
+        except (ValueError, TypeError):
+            conf = -1
 
-이미지 전체를 위에서 아래, 왼쪽에서 오른쪽 순서로 읽고
-실제로 보이는 한국어만 추출한 뒤 {target_market} 시장용 {target_language}로 현지화하세요.
+        latin_count = count_latin(text)
 
-반드시 JSON만 반환하세요.
+        if conf < 45:
+            continue
 
-형식:
-{{
-  "segments": [
-    {{
-      "order": 1,
-      "korean": "한국어 원문",
-      "translation": "현지화 번역",
-      "type": "headline | body | label | footnote | test_value | ingredients | other",
-      "review_required": false,
-      "review_reason": ""
-    }}
-  ]
-}}
+        if latin_count < 2:
+            continue
 
-규칙:
-1. 실제로 보이는 한국어만 적으세요.
-2. 작은 글자, 각주, 사용 전/사용 후, 표 안의 한국어, 테스트 설명도 확인하세요.
-3. 영어만 있는 브랜드명/제품명/패키지 영문은 새로 번역하지 마세요.
-4. 숫자, %, ppm, ml, g, 날짜, 시험 수치, 별표(*)는 그대로 유지하세요.
-5. 실제 전체 전성분 목록은 번역하지 마세요. 전체 전성분이 보이면 korean="전성분", translation="영문 INCI 유지", type="ingredients" 로 한 번만 적으세요.
-6. 제품 패키지, 시험성적서 이미지, 도장/스탬프, 인증서, QR코드 안 문구는 상세페이지 본문 카피가 아니라면 제외하세요.
-7. 같은 문구를 중복해서 적지 마세요.
-8. 여러 줄로 나뉜 하나의 문장은 합쳐서 적으세요.
-9. 단순 직역이 아니라 {target_market} 소비자가 자연스럽게 읽는 화장품 카피로 현지화하세요.
-10. 원문보다 강한 효능·안전성 주장을 새로 만들지 마세요.
-11. {safety_instruction}
-12. 시장별 규칙:\n{MARKET_RULES.get(target_market, '')}
-13. {concise_instruction}
-14. 고정 번역 사전은 반드시 우선 적용하세요:\n{dictionary_prompt}
-15. review_required=true 로 표시할 조건:
-   - 원문 의미가 모호해 두 가지 이상 번역 가능
-   - 광고 규제상 표현을 크게 순화해야 해서 원문과 차이가 커짐
-   - 숫자/시험 결과/기간/퍼센트가 복잡해 사람이 확인하는 것이 안전함
-   - 번역문이 디자인에 넣기에는 길어질 가능성이 큼
-   - 특정 문구 자체가 흐리거나 가려져 정확한 판독이 불확실함
-16. 이미지 전체의 해상도에 대해 추측하거나 경고하지 마세요. 실제 크기는 위에 제공된 값을 따르세요.
-17. 이미지에 한국어가 전혀 없다면 {"segments": []} 만 반환하세요.
-18. 위 조건이 없으면 review_required=false.
-19. 설명/해설 없이 JSON만 반환하세요.
-"""
-
-    response = client.responses.create(
-        model="gpt-5",
-        input=[
+        english_boxes.append(
             {
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": prompt},
-                    {"type": "input_image", "image_url": image_url, "detail": "high"},
-                ],
+                "text": text,
+                "x": int(data["left"][i]),
+                "y": int(data["top"][i]),
+                "w": int(data["width"][i]),
+                "h": int(data["height"][i]),
+                "confidence": conf,
             }
-        ],
-    )
-
-    parsed = parse_json_response(response.output_text)
-    segments = parsed.get("segments", []) if isinstance(parsed, dict) else []
-
-    cleaned = []
-    for idx, seg in enumerate(segments, start=1):
-        if not isinstance(seg, dict):
-            continue
-        korean = str(seg.get("korean", "")).strip()
-        translation = str(seg.get("translation", "")).strip()
-        seg_type = str(seg.get("type", "other")).strip() or "other"
-        if not korean and not translation:
-            continue
-
-        # 이미지에 없는 '저해상도 안내문' 같은 메타 응답은 결과에서 제거
-        if is_meta_commentary_segment(korean, translation):
-            continue
-
-        translation, dict_applied = apply_dictionary(korean, translation, dictionary)
-        length_info = length_check(korean, translation, seg_type)
-
-        ai_review = bool(seg.get("review_required", False))
-        reasons = []
-        ai_reason = scrub_false_resolution_reason(
-            seg.get("review_reason", ""),
-            image_width,
         )
-        if ai_review and ai_reason:
-            reasons.append(ai_reason)
 
-        source_numbers = extract_numbers(korean)
-        target_numbers = extract_numbers(translation)
-        if source_numbers != target_numbers and seg_type != "ingredients":
-            reasons.append("숫자/시험값 확인 필요")
+    return english_boxes
 
-        if length_info["too_long"]:
-            reasons.append(
-                f"디자인 길이 초과 ({length_info['ratio']}× / 권장 {length_info['limit']}× 이하)"
+def english_coverage(candidate, english_boxes):
+    """
+    후보 박스 내부를 영어 OCR 박스들이 얼마나 덮는지 계산합니다.
+    영어 단어가 2~3개로 분리돼도 합산하여 판정합니다.
+    """
+    candidate_area = max(1, candidate["w"] * candidate["h"])
+    covered = 0
+
+    for eng in english_boxes:
+        covered += intersection_area(candidate, eng)
+
+    # 겹치는 영어 박스끼리 중복 계산될 수 있으므로 1.0으로 제한
+    return min(1.0, covered / candidate_area)
+
+
+def upscale_for_ocr(image, scale=2):
+    """
+    작은 한글을 놓치지 않도록 OCR용으로 이미지를 확대합니다.
+    """
+    if scale == 1:
+        return image
+    w, h = image.size
+    return image.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.Resampling.LANCZOS)
+
+
+def run_korean_candidate_ocr(image):
+    """
+    한 번의 OCR 패스에서 한국어 후보 라인을 추출합니다.
+    v5에서는 원본 + 2배 확대본을 모두 사용해 작은 한글 누락을 줄입니다.
+    """
+    variants = [
+        (image, 1),
+        (upscale_for_ocr(image, 2), 2),
+    ]
+
+    all_lines = []
+
+    for variant_image, scale in variants:
+        data = pytesseract.image_to_data(
+            variant_image,
+            lang="kor+eng",
+            config="--oem 1 --psm 11",
+            output_type=Output.DICT,
+        )
+
+        groups = {}
+        total = len(data["text"])
+
+        for i in range(total):
+            raw_text = data["text"][i].strip()
+
+            try:
+                conf = float(data["conf"][i])
+            except (ValueError, TypeError):
+                conf = -1
+
+            if not raw_text or conf < 10:
+                continue
+
+            key = (
+                data["block_num"][i],
+                data["par_num"][i],
+                data["line_num"][i],
             )
 
-        if dict_applied:
-            dictionary_status = "고정 사전 적용"
-        else:
-            dictionary_status = ""
+            x = int(data["left"][i] / scale)
+            y = int(data["top"][i] / scale)
+            w = max(1, int(data["width"][i] / scale))
+            h = max(1, int(data["height"][i] / scale))
 
-        cleaned.append(
+            if key not in groups:
+                groups[key] = {
+                    "words": [],
+                    "x1": x,
+                    "y1": y,
+                    "x2": x + w,
+                    "y2": y + h,
+                    "conf_values": [],
+                }
+
+            groups[key]["words"].append(raw_text)
+            groups[key]["x1"] = min(groups[key]["x1"], x)
+            groups[key]["y1"] = min(groups[key]["y1"], y)
+            groups[key]["x2"] = max(groups[key]["x2"], x + w)
+            groups[key]["y2"] = max(groups[key]["y2"], y + h)
+            groups[key]["conf_values"].append(conf)
+
+        for group in groups.values():
+            line_text = re.sub(r"\s+", " ", " ".join(group["words"]).strip())
+            if not line_text:
+                continue
+
+            hangul_count = count_hangul(line_text)
+            latin_count = count_latin(line_text)
+
+            if hangul_count == 0 and latin_count == 0:
+                continue
+
+            avg_conf = sum(group["conf_values"]) / max(1, len(group["conf_values"]))
+
+            all_lines.append(
+                {
+                    "text": line_text,
+                    "x": group["x1"],
+                    "y": group["y1"],
+                    "w": max(1, group["x2"] - group["x1"]),
+                    "h": max(1, group["y2"] - group["y1"]),
+                    "confidence": round(avg_conf, 1),
+                }
+            )
+
+    all_lines = deduplicate_boxes(all_lines)
+    all_lines.sort(key=lambda item: (item["y"], item["x"]))
+    return all_lines
+
+
+
+def cluster_line_regions(candidates, image):
+    """
+    OCR이 한 문장을 여러 박스로 쪼갠 경우를 공간 기준으로 다시 묶습니다.
+    v5에서는 작은 한글도 놓치지 않기 위해 글자 크기 필터를 제거합니다.
+    """
+    if not candidates:
+        return []
+
+    cleaned = [item.copy() for item in candidates]
+    cleaned.sort(key=lambda x: (x["y"] + x["h"] / 2, x["x"]))
+    groups = []
+
+    for item in cleaned:
+        placed = False
+        item_cy = item["y"] + item["h"] / 2
+
+        for group in groups:
+            gy1 = min(x["y"] for x in group)
+            gy2 = max(x["y"] + x["h"] for x in group)
+            gcy = (gy1 + gy2) / 2
+            avg_h = sum(x["h"] for x in group) / len(group)
+
+            y_close = abs(item_cy - gcy) <= max(12, avg_h * 0.70)
+
+            gx1 = min(x["x"] for x in group)
+            gx2 = max(x["x"] + x["w"] for x in group)
+            ix1 = item["x"]
+            ix2 = item["x"] + item["w"]
+
+            if ix1 > gx2:
+                gap = ix1 - gx2
+            elif gx1 > ix2:
+                gap = gx1 - ix2
+            else:
+                gap = 0
+
+            max_gap = max(45, int(avg_h * 4.2), int(image.width * 0.055))
+
+            if y_close and gap <= max_gap:
+                group.append(item)
+                placed = True
+                break
+
+        if not placed:
+            groups.append([item])
+
+    regions = []
+
+    for group in groups:
+        x1 = min(x["x"] for x in group)
+        y1 = min(x["y"] for x in group)
+        x2 = max(x["x"] + x["w"] for x in group)
+        y2 = max(x["y"] + x["h"] for x in group)
+
+        regions.append(
             {
-                "order": idx,
-                "korean": korean,
-                "translation": translation,
-                "type": seg_type,
-                "review_required": bool(reasons),
-                "review_reason": " / ".join(dict.fromkeys(reasons)),
-                "length_ratio": length_info["ratio"],
-                "length_limit": length_info["limit"],
-                "too_long": length_info["too_long"],
-                "dictionary_status": dictionary_status,
+                "x": x1,
+                "y": y1,
+                "w": x2 - x1,
+                "h": y2 - y1,
             }
         )
 
-    cleaned = deduplicate_segments(cleaned)
-    return cleaned, response.output_text
+    regions.sort(key=lambda x: (x["y"], x["x"]))
+    return regions
 
 
-def translate_detail_image_auto_split(
-    image,
-    target_language,
-    target_market,
-    dictionary,
-    safety_mode,
-    short_mode,
-):
-    """
-    긴 상세페이지는 자동으로 세로 분할해서 순서대로 번역합니다.
-    Tesseract/OCR 패키지를 전혀 사용하지 않습니다.
-    """
-    chunks = split_tall_image(image, max_height=6000, overlap=450)
-    segment_groups = []
-    raw_responses = []
-
-    for chunk in chunks:
-        chunk_image = chunk["image"]
-        chunk_url = pil_to_data_url(chunk_image)
-
-        segments, raw_response = translate_detail_image(
-            chunk_url,
-            chunk_image.width,
-            chunk_image.height,
-            target_language,
-            target_market,
-            dictionary,
-            safety_mode,
-            short_mode,
-        )
-
-        # 어떤 조각에서 나온 문구인지 내부적으로 보존
-        for seg in segments:
-            seg["chunk_index"] = chunk["index"]
-            seg["chunk_y1"] = chunk["y1"]
-            seg["chunk_y2"] = chunk["y2"]
-
-        segment_groups.append(segments)
-        raw_responses.append(raw_response)
-
-    merged = merge_chunk_segments(segment_groups)
-
-    return merged, "\n\n--- CHUNK ---\n\n".join(raw_responses), len(chunks)
-
-
-def shorten_translations(segments, target_market, target_language):
-    candidates = [
-        {
-            "order": seg["order"],
-            "korean": seg["korean"],
-            "translation": seg["translation"],
-            "type": seg["type"],
-        }
-        for seg in segments
-        if seg.get("too_long")
-    ]
-
-    if not candidates:
-        return segments
-
-    prompt = f"""
-다음 {target_market} 시장용 {target_language} 화장품 번역문 중 길이가 긴 문장만 더 짧게 줄이세요.
-핵심 의미, 숫자, 시험값, 광고 리스크 완화 수준은 그대로 유지하세요.
-headline/label은 가능한 한 한 줄, body는 1~2개의 짧은 문장으로 만드세요.
-
-반드시 JSON만 반환:
-{{"items":[{{"order":1,"translation":"짧은 번역"}}]}}
-
-입력:
-{json.dumps(candidates, ensure_ascii=False)}
-"""
-
-    response = client.responses.create(
-        model="gpt-5",
-        input=[{"role": "user", "content": [{"type": "input_text", "text": prompt}]}],
+def ocr_line_with_conf(image, lang):
+    """한 줄 crop을 다시 OCR하고 평균 신뢰도를 함께 반환합니다."""
+    data = pytesseract.image_to_data(
+        image,
+        lang=lang,
+        config='--oem 1 --psm 7',
+        output_type=Output.DICT,
     )
-    parsed = parse_json_response(response.output_text)
-    mapping = {}
-    if isinstance(parsed, dict):
-        for item in parsed.get("items", []) or []:
-            try:
-                order = int(item.get("order"))
-            except Exception:
-                continue
-            mapping[order] = str(item.get("translation", "")).strip()
 
-    updated = []
-    for seg in segments:
-        new_seg = dict(seg)
-        if seg["order"] in mapping and mapping[seg["order"]]:
-            new_seg["translation"] = mapping[seg["order"]]
-            length_info = length_check(new_seg["korean"], new_seg["translation"], new_seg["type"])
-            new_seg["length_ratio"] = length_info["ratio"]
-            new_seg["length_limit"] = length_info["limit"]
-            new_seg["too_long"] = length_info["too_long"]
-            if not new_seg["too_long"]:
-                reasons = [
-                    reason.strip()
-                    for reason in new_seg.get("review_reason", "").split("/")
-                    if reason.strip() and "디자인 길이 초과" not in reason
-                ]
-                new_seg["review_reason"] = " / ".join(reasons)
-                new_seg["review_required"] = bool(reasons)
-        updated.append(new_seg)
-    return updated
+    parts = []
+    confs = []
+
+    for i, raw in enumerate(data['text']):
+        text = raw.strip()
+        if not text:
+            continue
+
+        try:
+            conf = float(data['conf'][i])
+        except (ValueError, TypeError):
+            conf = -1
+
+        if conf < 0:
+            continue
+
+        parts.append(text)
+        confs.append(conf)
+
+    text = re.sub(r'\s+', ' ', ' '.join(parts)).strip()
+    avg_conf = sum(confs) / len(confs) if confs else 0
+    return text, avg_conf
 
 
-def segments_to_text(file_name, market, language, segments):
-    parts = [
-        f"===== {file_name} =====",
-        f"판매 시장: {market}",
-        f"번역 언어: {language}",
-        "",
+
+def best_korean_line_read(crop):
+    """
+    원본/명암보정/반전 + 2배 확대본까지 함께 OCR해서
+    작은 한글 인식률을 높입니다.
+    """
+    gray = ImageOps.grayscale(crop)
+    contrast = ImageOps.autocontrast(gray).convert("RGB")
+    inverted = ImageOps.invert(ImageOps.autocontrast(gray)).convert("RGB")
+
+    base_variants = [
+        crop.convert("RGB"),
+        contrast,
+        inverted,
     ]
-    for seg in segments:
-        parts.extend(
-            [
-                f"[{seg['order']}]",
-                "[한국어]",
-                seg["korean"],
-                "",
-                f"[{language}]",
-                seg["translation"],
-                "",
-            ]
-        )
-    return "\n".join(parts)
 
-# ------------------------------------------------------------
-# Run translation
-# ------------------------------------------------------------
-if "v117_results" not in st.session_state:
-    st.session_state.v117_results = []
+    variants = []
+    for variant in base_variants:
+        variants.append(variant)
+        variants.append(upscale_for_ocr(variant, 2))
+
+    reads = []
+
+    for variant in variants:
+        text, conf = ocr_line_with_conf(variant, "kor+eng")
+        h_count = count_hangul(text)
+        l_count = count_latin(text)
+        ratio = h_count / max(1, h_count + l_count)
+
+        score = (h_count * 8) + (ratio * 20) + (conf * 0.25)
+        reads.append((score, text, conf, variant))
+
+    reads.sort(key=lambda x: x[0], reverse=True)
+    return reads[0][1], reads[0][2], reads[0][3]
+
+
+def english_ocr_evidence(crop):
+    """
+    영어 전용 OCR 결과를 원본/명암보정/2배 확대본에서 모아
+    영문 여부를 판단할 때만 사용합니다.
+    """
+    gray = ImageOps.grayscale(crop)
+    contrast = ImageOps.autocontrast(gray).convert("RGB")
+
+    variants = [
+        crop.convert("RGB"),
+        contrast,
+        upscale_for_ocr(contrast, 2),
+    ]
+
+    best = ("", 0.0, 0)
+
+    for variant in variants:
+        text, conf = ocr_line_with_conf(variant, "eng")
+        latin_count = count_latin(text)
+        score = (latin_count * 10) + conf
+
+        if score > ((best[2] * 10) + best[1]):
+            best = (text, conf, latin_count)
+
+    return best
+
+
+def is_probably_english_region(crop):
+    """
+    v5에서는 영어 제외 판단을 영어 전용 OCR 결과만으로 수행합니다.
+    """
+    eng_text, eng_conf, latin_count = english_ocr_evidence(crop)
+
+    cleaned = re.sub(r"[^A-Za-z0-9 ]", "", eng_text).strip()
+
+    if latin_count >= 4 and eng_conf >= 55:
+        return True
+
+    if len(cleaned.replace(" ", "")) >= 4 and eng_conf >= 60:
+        return True
+
+    return False
+
+
+
+def detect_korean_lines(image):
+    """
+    OCR v5
+
+    - 작은 한글을 놓치지 않도록 원본 + 2배 확대 OCR 추가
+    - 글자 크기 필터 제거
+    - 영문 제외는 영어 전용 OCR 결과만 사용
+    - 한 문장이 여러 박스로 분리되면 줄 단위로 다시 OCR
+    """
+    # 1) 원본 + 반전에서 후보 위치 수집
+    candidates = run_korean_candidate_ocr(image)
+
+    gray = ImageOps.grayscale(image)
+    inverted = ImageOps.invert(ImageOps.autocontrast(gray)).convert("RGB")
+    candidates.extend(run_korean_candidate_ocr(inverted))
+
+    # 2) 중복 후보를 정리하고 같은 줄을 공간 기준으로 묶기
+    candidates = deduplicate_boxes(candidates)
+    regions = cluster_line_regions(candidates, image)
+
+    final_lines = []
+    pad_x = max(8, int(image.width * 0.008))
+    pad_y = max(5, int(image.height * 0.004))
+
+    for region in regions:
+        x1 = max(0, region["x"] - pad_x)
+        y1 = max(0, region["y"] - pad_y)
+        x2 = min(image.width, region["x"] + region["w"] + pad_x)
+        y2 = min(image.height, region["y"] + region["h"] + pad_y)
+
+        crop = image.crop((x1, y1, x2, y2)).convert("RGB")
+
+        # 3) 합쳐진 줄 영역을 다시 한 줄 OCR
+        korean_text, korean_conf, best_variant = best_korean_line_read(crop)
+        korean_text = re.sub(r"\s+", " ", korean_text).strip()
+
+        h_count = count_hangul(korean_text)
+
+        if h_count == 0:
+            continue
+
+        # 한 글자 오탐은 기본 제외. '전/후'는 예외로 허용
+        allowed_single = {"전", "후"}
+        if h_count == 1 and korean_text not in allowed_single:
+            continue
+
+        # 4) 영어 전용 OCR 결과만으로 영문 제외
+        if is_probably_english_region(crop):
+            continue
+
+        final_lines.append(
+            {
+                "text": korean_text,
+                "x": region["x"],
+                "y": region["y"],
+                "w": region["w"],
+                "h": region["h"],
+                "confidence": round(korean_conf, 1),
+            }
+        )
+
+    # 5) 최종 중복 제거
+    final_lines = deduplicate_boxes(final_lines)
+    final_lines.sort(key=lambda item: (item["y"], item["x"]))
+    return final_lines
+
+
+def draw_detection_preview(image, lines):
+    """
+    원본 이미지를 복사해 한국어 OCR 박스만 표시합니다.
+    원본 파일 자체는 수정하지 않습니다.
+    """
+    preview = image.copy()
+    draw = ImageDraw.Draw(preview)
+
+    try:
+        font = ImageFont.truetype(
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            max(16, int(image.width * 0.022)),
+        )
+    except Exception:
+        font = ImageFont.load_default()
+
+    line_width = max(2, int(image.width * 0.004))
+
+    for index, line in enumerate(lines, start=1):
+        x1 = line["x"]
+        y1 = line["y"]
+        x2 = x1 + line["w"]
+        y2 = y1 + line["h"]
+
+        pad = max(3, int(image.width * 0.004))
+
+        x1 = max(0, x1 - pad)
+        y1 = max(0, y1 - pad)
+        x2 = min(image.width, x2 + pad)
+        y2 = min(image.height, y2 + pad)
+
+        draw.rectangle(
+            [x1, y1, x2, y2],
+            outline=(255, 0, 0),
+            width=line_width,
+        )
+
+        label = str(index)
+        label_x = x1
+        label_y = max(0, y1 - max(22, int(image.width * 0.03)))
+
+        bbox = draw.textbbox((label_x, label_y), label, font=font)
+        bg_pad = 3
+
+        draw.rectangle(
+            [
+                bbox[0] - bg_pad,
+                bbox[1] - bg_pad,
+                bbox[2] + bg_pad,
+                bbox[3] + bg_pad,
+            ],
+            fill=(255, 255, 255),
+        )
+
+        draw.text(
+            (label_x, label_y),
+            label,
+            fill=(255, 0, 0),
+            font=font,
+        )
+
+    return preview
+
+if "all_results" not in st.session_state:
+    st.session_state.all_results = []
+
+if "ocr_results" not in st.session_state:
+    st.session_state.ocr_results = {}
 
 if uploaded_files:
-    if st.button("🚀 원클릭 전체 번역", type="primary", use_container_width=True):
-        results = []
+    st.subheader("업로드된 이미지")
+    st.write(f"총 {len(uploaded_files)}장의 이미지가 업로드되었습니다.")
+    st.info("업로드한 순서대로 번역됩니다. (1번 → 2번 → 3번...)")
+
+    for idx, file in enumerate(uploaded_files, start=1):
+        st.markdown(f"**{idx}번 이미지: {file.name}**")
+
+    if st.button("🚀 AI 번역 시작", type="primary"):
+        all_results = []
         progress = st.progress(0)
 
         for idx, uploaded_file in enumerate(uploaded_files, start=1):
-            with st.spinner(f"{idx}/{len(uploaded_files)} · {uploaded_file.name} 번역 중..."):
-                image_url, image = image_to_data_url(uploaded_file)
-                try:
-                    segments, raw_response, chunk_count = translate_detail_image_auto_split(
-                        image,
-                        target_language,
-                        selected_market,
-                        st.session_state.translation_dictionary,
-                        safety_mode,
-                        short_mode,
-                    )
-                    results.append(
+            with st.spinner(f"{idx}/{len(uploaded_files)} 번역 중..."):
+                base64_image, preview_image = image_to_base64(uploaded_file)
+                target_language = language_map[selected_language]
+
+                prompt = f"""
+이 이미지는 한국 화장품 상세페이지의 분할 이미지입니다.
+
+작업 목표:
+1. 이미지 안의 한국어 문구를 위에서 아래 순서대로 읽으세요.
+2. 각 문구를 {target_language}로 자연스럽게 번역하세요.
+3. 결과는 반드시 아래 형식으로 정리하세요.
+
+[한국어]
+원문
+
+[{selected_language}]
+번역문
+
+규칙:
+1. 이미지에 실제로 보이는 문구만 적으세요.
+2. 숫자, %, ppm, ml, g, 날짜, 시험 수치는 원문 그대로 유지하세요.
+3. 브랜드명, 제품명, 영문 제품명은 함부로 번역하지 마세요.
+4. 전성분은 번역하지 말고 아래처럼 표시하세요:
+[전성분]
+영문 INCI 유지
+5. 화장품 광고 문구는 치료, 완치, 재생 같은 의료적 표현으로 과장하지 마세요.
+6. 원문 의미를 최대한 유지하면서 자연스럽게 번역하세요.
+7. 같은 문구가 반복되어 보이면 한 번만 정리하세요.
+8. 불필요한 설명은 쓰지 말고 한국어 원문과 번역 결과만 정리하세요.
+"""
+
+                response = client.responses.create(
+                    model="gpt-5",
+                    input=[
                         {
-                            "index": idx,
-                            "file_name": uploaded_file.name,
-                            "image": image,
-                            "segments": segments,
-                            "raw_response": raw_response,
-                            "chunk_count": chunk_count,
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": prompt,
+                                },
+                                {
+                                    "type": "input_image",
+                                    "image_url": f"data:image/jpeg;base64,{base64_image}",
+                                    "detail": "high",
+                                },
+                            ],
                         }
-                    )
-                except Exception as exc:
-                    results.append(
-                        {
-                            "index": idx,
-                            "file_name": uploaded_file.name,
-                            "image": image,
-                            "segments": [],
-                            "raw_response": "",
-                            "chunk_count": 0,
-                            "error": str(exc),
-                        }
-                    )
-            progress.progress(idx / len(uploaded_files))
+                    ],
+                )
 
-        st.session_state.v117_results = results
-        st.success("✅ 번역 완료")
+                all_results.append(
+                    {
+                        "index": idx,
+                        "file_name": uploaded_file.name,
+                        "image": preview_image,
+                        "translation": response.output_text,
+                        "language": selected_language,
+                    }
+                )
 
-# ------------------------------------------------------------
-# Results
-# ------------------------------------------------------------
-if st.session_state.v117_results:
-    total_segments = sum(len(item.get("segments", [])) for item in st.session_state.v117_results)
-    total_review = sum(
-        1
-        for item in st.session_state.v117_results
-        for seg in item.get("segments", [])
-        if seg.get("review_required")
-    )
-    total_long = sum(
-        1
-        for item in st.session_state.v117_results
-        for seg in item.get("segments", [])
-        if seg.get("too_long")
-    )
+                progress.progress(idx / len(uploaded_files))
 
+        st.session_state.all_results = all_results
+        st.session_state.ocr_results = {}
+        st.success("✅ 모든 이미지 번역이 완료되었습니다.")
+
+if st.session_state.all_results:
     st.markdown("---")
-    m1, m2, m3 = st.columns(3)
-    m1.metric("전체 문장", total_segments)
-    m2.metric("⚠ 검수 필요", total_review)
-    m3.metric("✂ 길이 초과", total_long)
+    st.header("📑 이미지별 번역 결과")
 
-    if total_long > 0:
-        if st.button("✂️ 긴 문장만 자동 축약", use_container_width=True):
-            with st.spinner("길이가 긴 번역만 다시 짧게 줄이고 있습니다..."):
-                updated_results = []
-                for item in st.session_state.v117_results:
-                    new_item = dict(item)
-                    if not item.get("error"):
-                        new_item["segments"] = shorten_translations(
-                            item.get("segments", []),
-                            selected_market,
-                            target_language,
+    combined_text = ""
+
+    for item in st.session_state.all_results:
+        st.markdown("---")
+        st.subheader(f"{item['index']}번 이미지 · {item['file_name']}")
+
+        top_col1, top_col2 = st.columns(2)
+
+        with top_col1:
+            st.download_button(
+                label=f"📥 {item['index']}번 번역문 다운로드",
+                data=item["translation"],
+                file_name=f"{item['index']:02d}_{item['language']}_translation.txt",
+                mime="text/plain",
+                key=f"download_original_{item['index']}",
+                use_container_width=True,
+            )
+
+        with top_col2:
+            find_boxes = st.button(
+                f"🔎 {item['index']}번 한국어 위치 찾기",
+                key=f"detect_{item['index']}",
+                use_container_width=True,
+            )
+
+        if find_boxes:
+            with st.spinner(
+                f"{item['index']}번 이미지에서 한국어 위치를 찾고 있습니다..."
+            ):
+                try:
+                    lines = detect_korean_lines(item["image"])
+                    preview = draw_detection_preview(item["image"], lines)
+
+                    st.session_state.ocr_results[item["index"]] = {
+                        "lines": lines,
+                        "preview": preview,
+                    }
+
+                    if lines:
+                        st.success(
+                            f"한국어 텍스트 영역 {len(lines)}개를 찾았습니다."
                         )
-                    updated_results.append(new_item)
-                st.session_state.v117_results = updated_results
-            st.rerun()
+                    else:
+                        st.warning(
+                            "한국어 영역을 찾지 못했습니다. 작은 글자나 장식 글자는 OCR에서 빠질 수 있습니다."
+                        )
 
-    tab_review, tab_all = st.tabs(["⚠ 검수 필요한 문장만", "📑 전체 번역"])
-
-    with tab_review:
-        review_found = False
-        for item in st.session_state.v117_results:
-            review_segments = [seg for seg in item.get("segments", []) if seg.get("review_required")]
-            if not review_segments:
-                continue
-            review_found = True
-            st.subheader(f"{item['index']}번 · {item['file_name']}")
-            for seg in review_segments:
-                st.markdown(f"**{seg['order']}. {seg['type']}**")
-                st.write(f"한국어: {seg['korean']}")
-                st.write(f"번역: {seg['translation']}")
-                if seg.get("review_reason"):
-                    st.warning(seg["review_reason"])
-                if seg.get("dictionary_status"):
-                    st.caption(seg["dictionary_status"])
-                st.markdown("---")
-        if not review_found:
-            st.success("✅ 현재 자동 검수 기준에서 확인이 필요한 문장이 없습니다.")
-
-    all_text_parts = []
-
-    with tab_all:
-        for item in st.session_state.v117_results:
-            st.markdown("---")
-            st.subheader(f"{item['index']}번 · {item['file_name']}")
-            col_image, col_result = st.columns([0.85, 1.25], gap="large")
-
-            with col_image:
-                st.image(item["image"], caption="원본 이미지", use_container_width=True)
-                st.caption(
-                    f"실제 업로드 크기: {item['image'].width} × {item['image'].height}px"
-                )
-                if item["image"].width >= 800:
-                    st.success("✅ 가로 800px 이상 · 해상도 경고 대상 아님")
-                else:
-                    st.warning("⚠ 가로 800px 미만 · 작은 글자 판독률이 떨어질 수 있음")
-
-            with col_result:
-                if item.get("error"):
-                    st.error("번역 중 오류가 발생했습니다.")
-                    st.code(item["error"])
-                    continue
-
-                segments = item.get("segments", [])
-                if not segments:
-                    st.warning("구조화된 번역 결과를 만들지 못했습니다.")
-                    st.text_area(
-                        "AI 원본 응답",
-                        value=item.get("raw_response", ""),
-                        height=300,
-                        key=f"raw_{item['index']}",
+                except Exception as exc:
+                    st.error(
+                        "OCR 실행에 실패했습니다. packages.txt에 Tesseract 한국어 언어팩이 설치되어 있는지 확인해 주세요."
                     )
-                    continue
+                    st.code(str(exc))
 
-                edited_segments = []
-                for seg_idx, segment in enumerate(segments, start=1):
-                    status = "⚠ 확인" if segment.get("review_required") else "✅ 사용 가능"
-                    length_status = (
-                        f"⚠ 길이 {segment.get('length_ratio')}×"
-                        if segment.get("too_long")
-                        else f"✅ 길이 {segment.get('length_ratio')}×"
-                    )
-                    st.markdown(f"**{seg_idx}. {segment['type']} · {status} · {length_status}**")
+        col_image, col_text = st.columns([1, 1], gap="large")
 
-                    korean_text = st.text_area(
-                        "한국어 원문",
-                        value=segment["korean"],
-                        height=75,
-                        key=f"ko_{item['index']}_{seg_idx}",
-                    )
-                    translated_text = st.text_area(
-                        f"{display_language} 번역",
-                        value=segment["translation"],
-                        height=90,
-                        key=f"tr_{item['index']}_{seg_idx}",
-                    )
+        with col_image:
+            st.markdown("### 🖼️ 원본 이미지")
+            st.image(item["image"], use_container_width=True)
 
-                    if segment.get("review_reason"):
-                        st.caption(f"검수: {segment['review_reason']}")
-                    if segment.get("dictionary_status"):
-                        st.caption(f"📘 {segment['dictionary_status']}")
+        with col_text:
+            st.markdown(f"### 🌐 {item['language']} 번역")
 
-                    edited_segments.append(
-                        {
-                            **segment,
-                            "order": seg_idx,
-                            "korean": korean_text,
-                            "translation": translated_text,
-                        }
-                    )
+            edited_translation = st.text_area(
+                "번역문 검수/수정",
+                value=item["translation"],
+                height=600,
+                key=f"translation_edit_{item['index']}",
+            )
 
-                item_text = segments_to_text(
-                    item["file_name"],
-                    selected_market,
-                    display_language,
-                    edited_segments,
-                )
-                all_text_parts.append(item_text)
+            st.download_button(
+                label="📥 수정한 번역문 다운로드",
+                data=edited_translation,
+                file_name=f"{item['index']:02d}_{item['language']}_final.txt",
+                mime="text/plain",
+                key=f"download_edit_{item['index']}",
+                use_container_width=True,
+            )
 
-                st.download_button(
-                    label=f"📥 {item['index']}번 번역 TXT 다운로드",
-                    data=item_text,
-                    file_name=f"{item['index']:02d}_{selected_market}_translation.txt",
-                    mime="text/plain",
-                    key=f"download_{item['index']}",
+        if item["index"] in st.session_state.ocr_results:
+            ocr_data = st.session_state.ocr_results[item["index"]]
+            lines = ocr_data["lines"]
+            preview = ocr_data["preview"]
+
+            st.markdown("### 🔎 한국어 위치 검사 결과")
+            st.caption(
+                "빨간 박스는 OCR이 찾은 한국어 영역입니다. 아직 번역문을 이미지에 넣지 않습니다."
+            )
+
+            preview_col, list_col = st.columns([1.2, 1], gap="large")
+
+            with preview_col:
+                st.image(
+                    preview,
+                    caption="한국어 위치 미리보기",
                     use_container_width=True,
                 )
 
-    if all_text_parts:
-        st.markdown("---")
-        st.header("📚 전체 번역 결과")
-        all_text = "\n\n".join(all_text_parts)
-        st.download_button(
-            label="📥 전체 번역 결과 TXT 다운로드",
-            data=all_text,
-            file_name=f"ALL_{selected_market}_translation.txt",
-            mime="text/plain",
-            use_container_width=True,
+                st.download_button(
+                    label="📥 위치 검사 이미지 PNG 다운로드",
+                    data=pil_to_png_bytes(preview),
+                    file_name=f"{item['index']:02d}_ocr_preview.png",
+                    mime="image/png",
+                    key=f"download_ocr_preview_{item['index']}",
+                    use_container_width=True,
+                )
+
+            with list_col:
+                if lines:
+                    for line_index, line in enumerate(lines, start=1):
+                        st.markdown(
+                            f"**{line_index}. {line['text']}**  \n"
+                            f"위치: x={line['x']}, y={line['y']}  \n"
+                            f"크기: {line['w']}×{line['h']}px  \n"
+                            f"OCR 신뢰도: {line['confidence']}"
+                        )
+                else:
+                    st.info("표시할 한국어 OCR 결과가 없습니다.")
+
+        combined_text += (
+            f"\n\n========== {item['index']}번 이미지 ==========\n"
+            f"파일명: {item['file_name']}\n\n"
+            f"{edited_translation}\n"
         )
+
+    st.markdown("---")
+    st.header("📚 전체 번역 결과")
+
+    st.text_area(
+        "전체 이미지 번역 모음",
+        value=combined_text,
+        height=600,
+        key="combined_translation",
+    )
+
+    st.download_button(
+        label="📥 전체 번역 결과 다운로드",
+        data=combined_text,
+        file_name=f"ALL_{selected_language}_translation.txt",
+        mime="text/plain",
+        key="download_all",
+    )
